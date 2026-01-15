@@ -48,6 +48,28 @@ trim() {
   echo -n "$var"
 }
 
+
+# ------------------------------
+# Pi / universal additions
+# ------------------------------
+is_unraid() {
+  [[ -f /etc/unraid-version || -d /usr/local/emhttp ]] && return 0 || return 1
+}
+
+pc_base_dir() {
+  # Prefer Unraid flash paths when available; otherwise use /var/lib/preclear-ng
+  if is_unraid && [[ -d /boot && -w /boot ]]; then
+    echo "/boot"
+  else
+    echo "/var/lib/preclear-ng"
+  fi
+}
+
+PC_BASE="$(pc_base_dir)"
+PC_PLUGIN_DIR="${PC_BASE}/config/plugins/preclear.disk"
+PC_REPORT_DIR="${PC_BASE}/preclear_reports"
+PC_TMP_DIR="/tmp/.preclear"
+mkdir -p "${PC_PLUGIN_DIR}" "${PC_REPORT_DIR}" "${PC_TMP_DIR}" 2>/dev/null || true
 list_unraid_disks(){
   local _result=$1
   local i=0
@@ -2038,10 +2060,15 @@ append canvas 'width'  '123'
 append canvas 'height' '20'
 append canvas 'brick'  '#'
 smart_type=auto
+pipeline_ng=n
+ng_no_signature=y
+ng_badblocks_patterns="0xaa,0x55,0xff,0x00"
+ng_badblocks_bsz=""
+ng_smart_long=y
 notify_channel=0
 notify_freq=0
 opts_long="frequency:,notify:,skip-preread,skip-postread,read-size:,write-size:,read-blocks:,test,no-stress,list,"
-opts_long+="cycles:,signature,verify,no-prompt,version,preclear-only,format-html,erase,erase-clear,load-file:,unassigned"
+opts_long+="cycles:,signature,verify,no-prompt,version,preclear-only,format-html,erase,erase-clear,load-file:,unassigned",pipeline-ng,no-signature,badblocks-blocksize:,badblocks-patterns:,smart-long
 
 OPTS=$(getopt -o f:n:sSr:w:b:tdlc:ujvomera:U \
       --long $opts_long -n "$(basename $0)" -- "$@")
@@ -2076,6 +2103,12 @@ while true ; do
     -a|--load-file)      load_file="$2";                      shift 2;;
     -U|--unassigned)     list_unassigned_disks;               exit 0;;
 
+    --pipeline-ng)       pipeline_ng=y;                      shift 1;;
+    --no-signature)      ng_no_signature=y;                  shift 1;;
+    --badblocks-blocksize) ng_badblocks_bsz="$2";            shift 2;;
+    --badblocks-patterns)  ng_badblocks_patterns="$2";       shift 2;;
+    --smart-long)        ng_smart_long=y;                    shift 1;;
+
     --) shift ; break ;;
     * ) echo "Internal error!" ; exit 1 ;;
   esac
@@ -2088,6 +2121,12 @@ if [ ! -b "$1" ]; then
 fi
 
 theDisk=$(echo $1|trim)
+
+# If requested, run the Pi/universal Preclear-NG pipeline and exit.
+if [[ "${pipeline_ng}" == "y" ]]; then
+  run_pipeline_ng "$theDisk"
+  exit $?
+fi
 
 debug "Command: $command"
 debug "Preclear Disk Version: ${version}"
@@ -2244,7 +2283,7 @@ append all_files 'smart_prefix'  "${all_files[dir]}/smart_"
 append all_files 'smart_final'   "${all_files[dir]}/smart_final"
 append all_files 'smart_out'     "${all_files[dir]}/smart_out"
 append all_files 'form_out'      "${all_files[dir]}/form_out"
-append all_files 'resume_file'   "/boot/config/plugins/preclear.disk/${disk_properties[serial]}.resume"
+append all_files 'resume_file'   "${PC_PLUGIN_DIR}/${disk_properties[serial]}.resume"
 append all_files 'resume_temp'   "/tmp/.preclear/${disk_properties[serial]}.resume"
 append all_files 'wait'          "${all_files[dir]}/wait"
 
@@ -2886,14 +2925,252 @@ else
   tmux kill-session -t "${report_tmux}" >/dev/null 2>&1
 fi
 
+
+# ------------------------------
+# Preclear-NG Pipeline (Pi / universal)
+# ------------------------------
+ng_log_line() {
+  local msg="$1"
+  echo "$(date '+%b %d %H:%M:%S') preclear-ng: $msg" | tee -a "$NG_LOG" >/dev/null
+}
+
+ng_draw() {
+  local step="$1"
+  local msg="$2"
+  clear || true
+  echo "####################################################################################################################"
+  printf "# %-114s #\n" ""
+  printf "# %-114s #\n" "Preclear-NG Pipeline (Pi / universal) - ${NG_DISK} (${NG_SERIAL})"
+  printf "# %-114s #\n" "Step ${step}/6 - ${msg}"
+  printf "# %-114s #\n" ""
+  echo "####################################################################################################################"
+  echo "# Last log lines:"
+  echo "####################################################################################################################"
+  tail -n 12 "$NG_LOG" 2>/dev/null || true
+  echo "####################################################################################################################"
+}
+
+ng_smart_attr() {
+  # Print "ID NAME RAW" per line for easier diffing
+  smartctl -A "$NG_DISK" 2>/dev/null | awk '
+    /^[[:space:]]*[0-9]+[[:space:]]/{
+      id=$1; name=$2; raw=$10;
+      # some outputs shift; grab last field as raw
+      raw=$NF;
+      print id, name, raw
+    }'
+}
+
+ng_smart_snapshot() {
+  local out="$1"
+  smartctl -a "$NG_DISK" > "$out" 2>&1 || true
+  ng_smart_attr > "${out}.attrs" 2>/dev/null || true
+}
+
+ng_dd_read() {
+  local label="$1"
+  ng_log_line "$label: starting full read (dd if=$NG_DISK of=/dev/null bs=4M)"
+  dd if="$NG_DISK" of=/dev/null bs=4M status=progress iflag=direct 2>>"$NG_LOG"
+  local rc=$?
+  ng_log_line "$label: dd exit code $rc"
+  return $rc
+}
+
+ng_dd_zero() {
+  local label="$1"
+  ng_log_line "$label: starting full zero write (dd if=/dev/zero of=$NG_DISK bs=4M)"
+  dd if=/dev/zero of="$NG_DISK" bs=4M status=progress oflag=direct conv=fsync 2>>"$NG_LOG"
+  local rc=$?
+  ng_log_line "$label: dd exit code $rc"
+  return $rc
+}
+
+ng_badblocks() {
+  local bsz="$1"
+  local pats_csv="$2"
+
+  # Convert "0xaa,0x55" -> patterns list for logging only; badblocks uses fixed 4 patterns by default.
+  # We'll run one badblocks pass (which already cycles patterns 0xaa,0x55,0xff,0x00).
+  ng_log_line "badblocks: starting destructive multi-pattern test (badblocks -wsv -b $bsz $NG_DISK)"
+  badblocks -wsv -b "$bsz" "$NG_DISK" >>"$NG_LOG" 2>&1
+  local rc=$?
+  ng_log_line "badblocks: exit code $rc"
+  return $rc
+}
+
+ng_smart_long_test() {
+  # Start long test, then poll until done
+  ng_log_line "SMART: starting long self-test"
+  local start_out
+  start_out="$(smartctl -t long "$NG_DISK" 2>&1 || true)"
+  echo "$start_out" >>"$NG_LOG"
+
+  # Poll status
+  while true; do
+    local st
+    st="$(smartctl -c "$NG_DISK" 2>&1 | grep -E 'Self-test execution status' || true)"
+    ng_log_line "SMART: ${st:-status unavailable}"
+    ng_draw 3 "SMART long self-test running (polling)"
+    # If status indicates completed (0%) we break. This is heuristic but works on most drives.
+    if echo "$st" | grep -qE 'completed|Completed|0% of test remaining'; then
+      break
+    fi
+    sleep 60
+  done
+
+  ng_log_line "SMART: self-test log (latest entries)"
+  smartctl -l selftest "$NG_DISK" >>"$NG_LOG" 2>&1 || true
+
+  # If the latest test entry shows "Completed without error", call it pass; otherwise fail.
+  if smartctl -l selftest "$NG_DISK" 2>/dev/null | head -n 15 | grep -qiE 'Completed without error'; then
+    ng_log_line "SMART: long self-test PASSED"
+    return 0
+  fi
+  ng_log_line "SMART: long self-test may have FAILED or is inconclusive (check log)"
+  return 1
+}
+
+ng_certificate() {
+  local status="$1"  # PASS/FAIL
+  local cert="$2"
+
+  {
+    echo "####################################################################################################################"
+    echo "# Preclear-NG Certificate"
+    echo "####################################################################################################################"
+    echo "Date: $(date -Is)"
+    echo "Disk: ${NG_DISK}"
+    echo "Serial: ${NG_SERIAL}"
+    echo "Model: ${NG_MODEL}"
+    echo "Status: ${status}"
+    echo ""
+    echo "Pipeline:"
+    echo "  1) Pre-read full surface scan"
+    echo "  2) Multi-pattern destructive badblocks"
+    echo "  3) SMART long self-test"
+    echo "  4) Full zero write"
+    echo "  5) Final full read verify"
+    echo "  6) SMART delta report"
+    echo ""
+    echo "SMART deltas (before -> after) for key attributes (if present):"
+    awk 'NR==FNR{a[$2]=$3;next}{
+      b=a[$2];
+      if(b=="" && $3!="") b="(missing)";
+      if($3=="" && b!="") $3="(missing)";
+      if(b!=$3){ printf "  %-28s %s -> %s\n",$2,b,$3 }
+    }' "${NG_SMART_BEFORE}.attrs" "${NG_SMART_AFTER}.attrs" 2>/dev/null || true
+    echo ""
+    echo "Log: ${NG_LOG}"
+    echo "SMART before: ${NG_SMART_BEFORE}"
+    echo "SMART after:  ${NG_SMART_AFTER}"
+    echo "####################################################################################################################"
+  } > "$cert"
+}
+
+run_pipeline_ng() {
+  NG_DISK="$1"
+
+  if [[ ! -b "$NG_DISK" ]]; then
+    echo "NG: '$NG_DISK' is not a block device."
+    exit 1
+  fi
+
+  NG_SERIAL="$(lsblk -dn -o SERIAL "$NG_DISK" 2>/dev/null | head -n1)"
+  NG_MODEL="$(lsblk -dn -o MODEL "$NG_DISK" 2>/dev/null | head -n1)"
+  [[ -z "$NG_SERIAL" ]] && NG_SERIAL="$(basename "$NG_DISK")"
+
+  NG_LOG="${PC_REPORT_DIR}/preclear-ng_${NG_SERIAL}_$(date +%Y.%m.%d_%H.%M.%S).log"
+  NG_SMART_BEFORE="${PC_REPORT_DIR}/smart_before_${NG_SERIAL}_$(date +%Y.%m.%d_%H.%M.%S).txt"
+  NG_SMART_AFTER="${PC_REPORT_DIR}/smart_after_${NG_SERIAL}_$(date +%Y.%m.%d_%H.%M.%S).txt"
+  NG_CERT="${PC_REPORT_DIR}/preclear-ng_certificate_${NG_SERIAL}_$(date +%Y.%m.%d_%H.%M.%S).txt"
+
+  touch "$NG_LOG" || { echo "Cannot write log to $NG_LOG"; exit 1; }
+
+  # Choose badblocks block size
+  local pbsz
+  pbsz="$(cat "/sys/block/$(basename "$NG_DISK")/queue/physical_block_size" 2>/dev/null || true)"
+  [[ -z "$pbsz" || "$pbsz" == "0" ]] && pbsz="4096"
+  local bsz="${ng_badblocks_bsz:-$pbsz}"
+
+  ng_draw 0 "Initializing"
+  ng_log_line "Starting Preclear-NG pipeline on $NG_DISK (serial=$NG_SERIAL model=$NG_MODEL)"
+  ng_log_line "Using badblocks block size: $bsz"
+
+  ng_draw 6 "Capturing SMART baseline"
+  ng_smart_snapshot "$NG_SMART_BEFORE"
+
+  # Step 1: Pre-read
+  ng_draw 1 "Pre-read full surface scan"
+  if ! ng_dd_read "Step1 Pre-read"; then
+    ng_log_line "FAIL: pre-read failed"
+    ng_smart_snapshot "$NG_SMART_AFTER"
+    ng_certificate "FAIL" "$NG_CERT"
+    echo "NG pipeline FAILED (pre-read). Certificate: $NG_CERT"
+    exit 2
+  fi
+
+  # Step 2: badblocks
+  ng_draw 2 "badblocks multi-pattern destructive test"
+  if ! ng_badblocks "$bsz" "$ng_badblocks_patterns"; then
+    ng_log_line "FAIL: badblocks found errors"
+    ng_smart_snapshot "$NG_SMART_AFTER"
+    ng_certificate "FAIL" "$NG_CERT"
+    echo "NG pipeline FAILED (badblocks). Certificate: $NG_CERT"
+    exit 3
+  fi
+
+  # Step 3: SMART long self-test
+  if [[ "${ng_smart_long}" == "y" ]]; then
+    ng_draw 3 "SMART long self-test"
+    if ! ng_smart_long_test; then
+      ng_log_line "FAIL: SMART long self-test did not pass"
+      ng_smart_snapshot "$NG_SMART_AFTER"
+      ng_certificate "FAIL" "$NG_CERT"
+      echo "NG pipeline FAILED (SMART long). Certificate: $NG_CERT"
+      exit 4
+    fi
+  fi
+
+  # Step 4: zero write
+  ng_draw 4 "Full zero write"
+  if ! ng_dd_zero "Step4 Zero"; then
+    ng_log_line "FAIL: zero write failed"
+    ng_smart_snapshot "$NG_SMART_AFTER"
+    ng_certificate "FAIL" "$NG_CERT"
+    echo "NG pipeline FAILED (zero write). Certificate: $NG_CERT"
+    exit 5
+  fi
+
+  # Step 5: final read verify
+  ng_draw 5 "Final full read verify"
+  if ! ng_dd_read "Step5 Final read"; then
+    ng_log_line "FAIL: final read verify failed"
+    ng_smart_snapshot "$NG_SMART_AFTER"
+    ng_certificate "FAIL" "$NG_CERT"
+    echo "NG pipeline FAILED (final read). Certificate: $NG_CERT"
+    exit 6
+  fi
+
+  # Step 6: SMART delta + certificate
+  ng_draw 6 "Capturing SMART after + generating certificate"
+  ng_smart_snapshot "$NG_SMART_AFTER"
+  ng_certificate "PASS" "$NG_CERT"
+
+  ng_log_line "PASS: Preclear-NG pipeline finished successfully"
+  ng_draw 6 "DONE - PASS (certificate generated)"
+  echo "NG pipeline PASSED. Certificate: $NG_CERT"
+  echo "Log: $NG_LOG"
+}
+
+
 # Remove empy lines
 sed -i '/^$/{:a;N;s/\n$//;ta}' $report
 
 # Save report to Flash disk
-mkdir -p /boot/preclear_reports/
+mkdir -p "${PC_REPORT_DIR}"/
 date_formated=$(date "+%Y.%m.%d_%H.%M.%S")
 file_name=$(echo "preclear_report_${disk_properties[serial]}_${date_formated}.txt" | sed -e 's/[^A-Za-z0-9._-]/_/g')
-todos < $report > "/boot/preclear_reports/${file_name}"
+todos < $report > "${PC_REPORT_DIR}/${file_name}"
 
 save_report "Yes" "$preread_speed" "$postread_speed" "$write_speed"
 
