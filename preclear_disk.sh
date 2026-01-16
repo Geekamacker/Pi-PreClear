@@ -1,6 +1,7 @@
 #!/bin/bash
 #
-# Pi-PreClear NG (Software-only build)
+# Pi-PreClear (Default: NG Pipeline)
+# - Runs NG pipeline by default; use --legacy to run classic pre-read/write/post-read.
 # - No power-cut / vibration / external-hardware tests included
 # - Keeps: burn-in pipeline, SMART deltas, thermal HUD, resume, head-park stress (hdparm), latency probe (fio) if installed
 #
@@ -1895,7 +1896,7 @@ append canvas 'width'  '123'
 append canvas 'height' '20'
 append canvas 'brick'  '#'
 smart_type=auto
-pipeline_ng=n
+pipeline_ng=y
 ng_no_signature=y
 ng_badblocks_patterns="0xaa,0x55,0xff,0x00"
 ng_badblocks_bsz=""
@@ -1903,7 +1904,7 @@ ng_smart_long=y
 notify_channel=0
 notify_freq=0
 opts_long="frequency:,notify:,skip-preread,skip-postread,read-size:,write-size:,read-blocks:,test,no-stress,list,"
-opts_long+="cycles:,no-prompt,version,format-html,erase,erase-clear,load-file:,unassigned",pipeline-ng,no-signature,badblocks-blocksize:,badblocks-patterns:,smart-long
+opts_long+="cycles:,no-prompt,version,format-html,erase,erase-clear,load-file:,unassigned",pipeline-ng,legacy,no-signature,badblocks-blocksize:,badblocks-patterns:,smart-long
 
 OPTS=$(getopt -o f:n:sSr:w:b:tdlc:jvmera:U \
       --long $opts_long -n "$(basename $0)" -- "$@")
@@ -1934,6 +1935,7 @@ while true ; do
     -U|--unassigned)     list_unassigned_disks;               exit 0;;
 
     --pipeline-ng)       pipeline_ng=y;                      shift 1;;
+    --legacy)          pipeline_ng=n;                      shift 1;;
     --no-signature)      ng_no_signature=y;                  shift 1;;
     --badblocks-blocksize) ng_badblocks_bsz="$2";            shift 2;;
     --badblocks-patterns)  ng_badblocks_patterns="$2";       shift 2;;
