@@ -23,6 +23,14 @@ ionice -c3 -p$BASHPID
 # Version
 version="1.0.22"
 
+# Pi-only defaults
+PLATFORM_NAME="Pi"
+LOG_FILE="/var/log/preclear.disk.log"
+if ! ( [ -d /var/log ] && [ -w /var/log ] ); then
+  LOG_FILE="/tmp/preclear.disk.log"
+fi
+
+
 ######################################################
 ##                                                  ##
 ##                 PROGRAM FUNCTIONS                ##
@@ -34,11 +42,11 @@ debug() {
   local msg="$*"
   if [ -z "$msg" ]; then
     while read msg; do 
-      cat <<< "$(date +"%b %d %T" ) ${log_prefix} $msg" >> /var/log/preclear.disk.log
+      cat <<< "$(date +"%b %d %T" ) ${log_prefix} $msg" >> "${LOG_FILE}"
       logger --id="${script_pid}" -t "${syslog_prefix}" "${msg}"
     done
   else
-    cat <<< "$(date +"%b %d %T" ) ${log_prefix} $msg" >> /var/log/preclear.disk.log
+    cat <<< "$(date +"%b %d %T" ) ${log_prefix} $msg" >> "${LOG_FILE}"
     logger --id="${script_pid}" -t "${syslog_prefix}" "${msg}"
   fi
 }
@@ -54,140 +62,141 @@ trim() {
 }
 
 
-# ------------------------------
-# Pi / universal additions
-# ------------------------------
-is_unraid() {
-  [[ -f /etc/unraid-version || -d /usr/local/emhttp ]] && return 0 || return 1
-}
 
-pc_base_dir() {
-  # Prefer Unraid flash paths when available; otherwise use /var/lib/preclear-ng
-  if is_unraid && [[ -d /boot && -w /boot ]]; then
-    echo "/boot"
-  else
-    echo "/var/lib/preclear-ng"
-  fi
+pc_base_dir(){
+  # Pi-only: prefer /var/lib/preclear-ng unless PC_BASE is overridden
+  echo "${PC_BASE:-/var/lib/preclear-ng}"
 }
 
 PC_BASE="$(pc_base_dir)"
-PC_PLUGIN_DIR="${PC_BASE}/config/plugins/preclear.disk"
+PC_PLUGIN_DIR="${PC_BASE}/pi-preclear"
 PC_REPORT_DIR="${PC_BASE}/preclear_reports"
 PC_TMP_DIR="/tmp/.preclear"
 mkdir -p "${PC_PLUGIN_DIR}" "${PC_REPORT_DIR}" "${PC_TMP_DIR}" 2>/dev/null || true
-list_unraid_disks(){
-  local _result=$1
-  local i=0
-  # Get flash disk device
-  unraid_disks[$i]=$(readlink -f /dev/disk/by-label/UNRAID|grep -Po "[^\d]*")
-
-  # Grab cache disks using disks.cfg file
-  if [ -f "/boot/config/disk.cfg" ]
-  then
-    while read line ; do
-      if [ -n "$line" ]; then
-        let "i+=1" 
-        unraid_disks[$i]=$(find /dev/disk/by-id/ -type l -iname "*-$line*" ! -iname "*-part*"| xargs readlink -f)
-      fi
-    done < <(cat /boot/config/disk.cfg|grep 'cacheId'|grep -Po '=\"\K[^\"]*')
-  fi
-
-  # Get array disks using super.dat id's
-  if [ -f "/var/local/emhttp/disks.ini" ]; then
-    while read line; do
-      disk="/dev/${line}"
-      if [ -n "$disk" ]; then
-        let "i+=1"
-        unraid_disks[$i]=$(readlink -f $disk)
-      fi
-    done < <(cat /var/local/emhttp/disks.ini | grep -Po 'device="\K[^"]*')
-  fi
-  eval "$_result=(${unraid_disks[@]})"
-}
-
 list_all_disks(){
   local _result=$1
-  for disk in $(find /dev/disk/by-id/ -type l ! \( -iname "wwn-*" -o -iname "*-part*" \))
-  do
-    all_disks+=($(readlink -f $disk))
-  done
+  local all_disks=()
+  while read -r name typ; do
+    [ "$typ" = "disk" ] || continue
+    all_disks+=("/dev/${name}")
+  done < <(lsblk -dn -o NAME,TYPE 2>/dev/null || true)
   eval "$_result=(${all_disks[@]})"
 }
 
-is_preclear_candidate () {
-  list_unraid_disks unraid_disks
-  part=($(comm -12 <(for X in "${unraid_disks[@]}"; do echo "${X}"; done|sort)  <(echo $1)))
-  if [ ${#part[@]} -eq 0 ] && [ $(cat /proc/mounts|grep -Poc "^${1}") -eq 0 ]
-  then
-    return 0
+
+get_root_parent_disk() {
+  local src base
+  src=$(findmnt -n -o SOURCE / 2>/dev/null || true)
+  src=$(readlink -f "$src" 2>/dev/null || echo "$src")
+  base=$(basename "$src")
+  # handle nvme0n1p2, mmcblk0p2, sda2
+  if [[ "$base" == *p[0-9]* ]]; then
+    echo "${base%%p[0-9]*}"
   else
-    return 1
+    echo "${base%%[0-9]*}"
   fi
 }
 
-# list the disks that are not assigned to the array. They are the possible drives to pre-clear
+disk_has_forbidden_membership() {
+  # Returns 0 (true) if any partition looks like RAID/LVM/crypto/etc.
+  local disk="$1" entry dev type
+  while read -r entry; do
+    dev="/dev/${entry}"
+    type=$(blkid -o value -s TYPE "$dev" 2>/dev/null || true)
+    case "$type" in
+      linux_raid_member|LVM2_member|crypto_LUKS|zfs_member|btrfs|swap)
+        return 0
+        ;;
+    esac
+  done < <(lsblk -nr -o NAME "$disk" 2>/dev/null || true)
+  return 1
+}
+
+sanitize_id() {
+  # Keep filenames/log prefixes safe
+  echo -n "$1" | tr -cd 'A-Za-z0-9._-'
+}
+
+is_preclear_candidate () {
+  local disk="$1"
+  local name
+  name=$(basename "$disk")
+  local root
+  root=$(get_root_parent_disk)
+
+  # Never allow wiping the root/OS disk by default
+  if [ -n "$root" ] && [ "$name" = "$root" ]; then
+    return 1
+  fi
+
+  # Block if any partition is mounted
+  if lsblk -nr -o MOUNTPOINT "$disk" 2>/dev/null | grep -q .; then
+    return 1
+  fi
+
+  # Block if kernel says something holds it (dm, md, etc.)
+  if ls -A "/sys/block/${name}/holders" 2>/dev/null | grep -q .; then
+    return 1
+  fi
+
+  # Block if it looks like RAID/LVM/crypto member
+  if disk_has_forbidden_membership "$disk"; then
+    return 1
+  fi
+
+  return 0
+}
+
+# list disks detected on this Linux system (safe candidates for Pi preclear)
 list_device_names() {
   echo "====================================$ver"
-  echo " Disks not assigned to the unRAID array "
-  echo "  (potential candidates for clearing) "
+  echo " Disks detected (candidates for Pi preclear) "
+  echo "  (safe candidates for clearing) "
   echo "========================================"
-  list_unraid_disks unraid_disks
-  list_all_disks all_disks
-  unassigned=($(comm -23 <(for X in "${all_disks[@]}"; do echo "${X}"; done|sort)  <(for X in "${unraid_disks[@]}"; do echo "${X}"; done|sort)))
 
-  if [ ${#unassigned[@]} -gt 0 ]
-  then
-    for disk in "${unassigned[@]}"
-    do
-      if [ $(cat /proc/mounts|grep -Poc "^${disk}") -eq 0 ]
-      then
-        serial=$(udevadm info --query=property --path $(udevadm info -q path -n $disk 2>/dev/null) 2>/dev/null|grep -Po "ID_SERIAL=\K.*")
-        echo "     ${disk} = ${serial}"
-      fi
-    done
-  else
-    echo "No un-assigned disks detected."
+  list_all_disks all_disks
+  local candidates=()
+  for d in "${all_disks[@]}"; do
+    if is_preclear_candidate "$d"; then
+      candidates+=("$d")
+    fi
+  done
+
+  if [ ${#candidates[@]} -eq 0 ]; then
+    echo "No candidate disks detected."
+    return 0
   fi
+
+  for disk in "${candidates[@]}"; do
+    # Pull serial in a safe, portable way
+    serial=$(udevadm info --query=property --name "$disk" 2>/dev/null | sed -n 's/^ID_SERIAL=//p' | head -n 1)
+    serial=$(sanitize_id "${serial:-unknown}")
+    echo "     ${disk} = ${serial}"
+  done
 }
 
 list_unassigned_disks() {
-  list_unraid_disks unraid_disks
   list_all_disks all_disks
-  unassigned=($(comm -23 <(for X in "${all_disks[@]}"; do echo "${X}"; done|sort)  <(for X in "${unraid_disks[@]}"; do echo "${X}"; done|sort)))
+  local candidates=()
+  for d in "${all_disks[@]}"; do
+    if is_preclear_candidate "$d"; then
+      candidates+=("$d")
+    fi
+  done
 
-  if [ ${#unassigned[@]} -gt 0 ]
-  then
-    for disk in "${unassigned[@]}"
-    do
-      if [ $(cat /proc/mounts|grep -Poc "^${disk}") -eq 0 ]
-      then
-        serial=$(udevadm info --query=property --path $(udevadm info -q path -n $disk 2>/dev/null) 2>/dev/null|grep -Po "ID_SERIAL=\K.*")
-        name=$(basename $disk)
-        echo "$name = $serial"
-      fi
-    done
-  fi
+  for disk in "${candidates[@]}"; do
+    serial=$(udevadm info --query=property --name "$disk" 2>/dev/null | sed -n 's/^ID_SERIAL=//p' | head -n 1)
+    serial=$(sanitize_id "${serial:-unknown}")
+    name=$(basename "$disk")
+    echo "$name = $serial"
+  done
 }
 
 # gfjardim - add notification system capability without breaking legacy mail.
 send_mail() {
-  subject=$(echo ${1})
-  description=$(echo ${2})
-  message=$(echo ${3})
-  recipient=${4}
-  if [ -n "${5}" ]; then
-    importance="${5}"
-  else
-    importance="normal"
-  fi
-  if [ -f "/usr/local/sbin/notify" ]; then # unRAID 6.0
-    notify_script="/usr/local/sbin/notify"
-  elif [ -f "/usr/local/emhttp/plugins/dynamix/scripts/notify" ]; then # unRAID 6.1
-    notify_script="/usr/local/emhttp/plugins/dynamix/scripts/notify"
-  else # unRAID pre 6.0
-    return 1
-  fi
-  $notify_script -e "Preclear on ${disk_properties[serial]}" -s """${subject}""" -d """${description}""" -m """${message}""" -i "${importance} ${notify_channel}"
+  # Pi-only build: no built-in notifications.
+  # Keeping function for compatibility with the original script.
+  return 0
 }
 
 append() {
@@ -232,184 +241,6 @@ array_enumerate2() {
 }
 
 array_content() { local _arr=$(eval "declare -p $1") && echo "${_arr#*=}"; }
-
-read_mbr() {
-  # called read_mbr [variable] "/dev/sdX" 
-  local disk=$1 i
-  local mbr
-
-  # verify MBR boot area is clear
-  append mbr `dd bs=446 count=1 if=$disk 2>/dev/null        |sum|awk '{print $1}'`
-
-  # verify partitions 2,3, & 4 are cleared
-  append mbr `dd bs=1 skip=462 count=48 if=$disk 2>/dev/null|sum|awk '{print $1}'`
-
-  # verify partition type byte is clear
-  append mbr `dd bs=1 skip=450 count=1 if=$disk  2>/dev/null|sum|awk '{print $1}'`
-
-  # verify MBR signature bytes are set as expected
-  append mbr `dd bs=1 count=1 skip=511 if=$disk 2>/dev/null |sum|awk '{print $1}'`
-  append mbr `dd bs=1 count=1 skip=510 if=$disk 2>/dev/null |sum|awk '{print $1}'`
-
-  for i in $(seq 446 461); do
-    append mbr `dd bs=1 count=1 skip=$i if=$disk 2>/dev/null|sum|awk '{print $1}'`
-  done
-  echo $(declare -p mbr)
-}
-
-verify_mbr() {
-  # called verify_mbr "/dev/disX"
-  local cleared
-  local disk=$1
-  local disk_blocks=${disk_properties[blocks_512]}
-  local i
-  local max_mbr_blocks
-  local mbr_blocks
-  local over_mbr_size
-  local partition_size
-  local patterns
-  local -a sectors
-  local start_sector 
-  local patterns=("00000" "00000" "00000" "00170" "00085")
-  local max_mbr_blocks=$(printf "%d" 0xFFFFFFFF)
-
-  if [ $disk_blocks -ge $max_mbr_blocks ]; then
-    over_mbr_size="y"
-    patterns+=("00000" "00000" "00002" "00000" "00000" "00255" "00255" "00255")
-    partition_size=$(printf "%d" 0xFFFFFFFF)
-  else
-    patterns+=("00000" "00000" "00000" "00000" "00000" "00000" "00000" "00000")
-    partition_size=$disk_blocks
-  fi
-
-  # verify MBR boot area is clear
-  sectors+=(`dd bs=446 count=1 if=$disk 2>/dev/null        |sum|awk '{print $1}'`)
-
-  # verify partitions 2,3, & 4 are cleared
-  sectors+=(`dd bs=1 skip=462 count=48 if=$disk 2>/dev/null|sum|awk '{print $1}'`)
-
-  # verify partition type byte is clear
-  sectors+=(`dd bs=1 skip=450 count=1 if=$disk  2>/dev/null|sum|awk '{print $1}'`)
-
-  # verify MBR signature bytes are set as expected
-  sectors+=(`dd bs=1 count=1 skip=511 if=$disk 2>/dev/null |sum|awk '{print $1}'`)
-  sectors+=(`dd bs=1 count=1 skip=510 if=$disk 2>/dev/null |sum|awk '{print $1}'`)
-
-  for i in $(seq 446 461); do
-    sectors+=(`dd bs=1 count=1 skip=$i if=$disk 2>/dev/null|sum|awk '{print $1}'`)
-  done
-
-  for i in $(seq 0 $((${#patterns[@]}-1)) ); do
-    if [ "${sectors[$i]}" != "${patterns[$i]}" ]; then
-      echo "Failed test 1: MBR signature is not valid, byte $i [${sectors[$i]}] != [${patterns[$i]}]"
-      debug "Signature: failed test 1: MBR signature is not valid, byte $i [${sectors[$i]}] != [${patterns[$i]}]"
-      array_enumerate2 sectors
-      return 1
-    fi
-  done
-
-  for i in $(seq ${#patterns[@]} $((${#sectors[@]}-1)) ); do
-    if [ $i -le 16 ]; then
-      start_sector="$(echo ${sectors[$i]}|awk '{printf("%02x", $1)}')${start_sector}"
-    else
-      mbr_blocks="$(echo ${sectors[$i]}|awk '{printf("%02x", $1)}')${mbr_blocks}"
-    fi
-  done
-
-  start_sector=$(printf "%d" "0x${start_sector}")
-  mbr_blocks=$(printf "%d" "0x${mbr_blocks}")
-
-  case "$start_sector" in
-    63|64)
-      if [ $disk_blocks -ge $max_mbr_blocks ]; then
-        partition_size=$(printf "%d" 0xFFFFFFFF)
-      else
-        let partition_size=($disk_blocks - $start_sector)
-      fi
-      ;;
-    1)
-      if [ "$over_mbr_size" != "y" ]; then
-        echo "Failed test 2: GPT start sector [$start_sector] is wrong, should be [1]."
-        debug "Signature: failed test 2: GPT start sector [$start_sector] is wrong, should be [1]."
-        array_enumerate2 sectors
-        return 1
-      fi
-      ;;
-    *)
-      echo "Failed test 3: start sector is different from those accepted by unRAID."
-      debug "Signature: failed test 3: start sector is different from those accepted by unRAID."
-      array_enumerate2 sectors
-      ;;
-  esac
-  if [ $partition_size -ne $mbr_blocks ]; then
-    echo "Failed test 4: physical size didn't match MBR declared size. [$partition_size] != [$mbr_blocks]"
-    debug "Signature: failed test 4: physical size didn't match MBR declared size. [$partition_size] != [$mbr_blocks]"
-    array_enumerate2 sectors
-    return 1
-  fi
-  return 0
-}
-
-write_signature() {
-  local disk=${disk_properties[device]}
-  local disk_blocks=${disk_properties[blocks_512]} 
-  local max_mbr_blocks partition_size size1=0 size2=0 sig start_sector=$1 var
-  let partition_size=($disk_blocks - $start_sector)
-  max_mbr_blocks=$(printf "%d" 0xFFFFFFFF)
-  
-  if [ $disk_blocks -ge $max_mbr_blocks ]; then
-    size1=$(printf "%d" "0x00020000")
-    size2=$(printf "%d" "0xFFFFFF00")
-    start_sector=1
-    partition_size=$(printf "%d" 0xFFFFFFFF)
-  fi
-
-  dd if=/dev/zero bs=1 seek=462 count=48 of=$disk >/dev/null 2>&1
-  dd if=/dev/zero bs=446 count=1 of=$disk  >/dev/null 2>&1
-  echo -ne "\0252" | dd bs=1 count=1 seek=511 of=$disk >/dev/null 2>&1
-  echo -ne "\0125" | dd bs=1 count=1 seek=510 of=$disk >/dev/null 2>&1
-
-  awk 'BEGIN{
-  printf ("%c%c%c%c%c%c%c%c%c%c%c%c%c%c%c%c",
-  strtonum("0x" substr(sprintf( "%08x\n", ARGV[1]),7,2)),
-  strtonum("0x" substr(sprintf( "%08x\n", ARGV[1]),5,2)),
-  strtonum("0x" substr(sprintf( "%08x\n", ARGV[1]),3,2)),
-  strtonum("0x" substr(sprintf( "%08x\n", ARGV[1]),1,2)),
-  strtonum("0x" substr(sprintf( "%08x\n", ARGV[2]),7,2)),
-  strtonum("0x" substr(sprintf( "%08x\n", ARGV[2]),5,2)),
-  strtonum("0x" substr(sprintf( "%08x\n", ARGV[2]),3,2)),
-  strtonum("0x" substr(sprintf( "%08x\n", ARGV[2]),1,2)),
-  strtonum("0x" substr(sprintf( "%08x\n", ARGV[3]),7,2)),
-  strtonum("0x" substr(sprintf( "%08x\n", ARGV[3]),5,2)),
-  strtonum("0x" substr(sprintf( "%08x\n", ARGV[3]),3,2)),
-  strtonum("0x" substr(sprintf( "%08x\n", ARGV[3]),1,2)),
-  strtonum("0x" substr(sprintf( "%08x\n", ARGV[4]),7,2)),
-  strtonum("0x" substr(sprintf( "%08x\n", ARGV[4]),5,2)),
-  strtonum("0x" substr(sprintf( "%08x\n", ARGV[4]),3,2)),
-  strtonum("0x" substr(sprintf( "%08x\n", ARGV[4]),1,2)))
-  }' $size1 $size2 $start_sector $partition_size | dd seek=446 bs=1 count=16 of=$disk >/dev/null 2>&1
-
-  local sig=$(awk 'BEGIN{
-  printf ("%c%c%c%c%c%c%c%c%c%c%c%c%c%c%c%c",
-  strtonum("0x" substr(sprintf( "%08x\n", ARGV[1]),7,2)),
-  strtonum("0x" substr(sprintf( "%08x\n", ARGV[1]),5,2)),
-  strtonum("0x" substr(sprintf( "%08x\n", ARGV[1]),3,2)),
-  strtonum("0x" substr(sprintf( "%08x\n", ARGV[1]),1,2)),
-  strtonum("0x" substr(sprintf( "%08x\n", ARGV[2]),7,2)),
-  strtonum("0x" substr(sprintf( "%08x\n", ARGV[2]),5,2)),
-  strtonum("0x" substr(sprintf( "%08x\n", ARGV[2]),3,2)),
-  strtonum("0x" substr(sprintf( "%08x\n", ARGV[2]),1,2)),
-  strtonum("0x" substr(sprintf( "%08x\n", ARGV[3]),7,2)),
-  strtonum("0x" substr(sprintf( "%08x\n", ARGV[3]),5,2)),
-  strtonum("0x" substr(sprintf( "%08x\n", ARGV[3]),3,2)),
-  strtonum("0x" substr(sprintf( "%08x\n", ARGV[3]),1,2)),
-  strtonum("0x" substr(sprintf( "%08x\n", ARGV[4]),7,2)),
-  strtonum("0x" substr(sprintf( "%08x\n", ARGV[4]),5,2)),
-  strtonum("0x" substr(sprintf( "%08x\n", ARGV[4]),3,2)),
-  strtonum("0x" substr(sprintf( "%08x\n", ARGV[4]),1,2)))
-  }' $size1 $size2 $start_sector $partition_size | od -An -vtu1 )
-  debug "Signature: writing signature: ${sig}"
-}
 
 maxExecTime() {
   # maxExecTime prog_name disk_name max_exec_time
@@ -1813,9 +1644,9 @@ save_report() {
   text+="performance tunning and usage statistics that will be open to the community. For detailed information, please visit the "
   text+="<a href='http://lime-technology.com/forum/index.php?topic=39985.0'>support forum topic</a>."
 
-  local log=$(cat "/var/log/preclear.disk.log" | grep -Po "${log_entry} \K.*" | tr '"' "'" | sed ':a;N;$!ba;s/\n/^n/g')
+  local log=$(cat "${LOG_FILE}" | grep -Po "${log_entry} \K.*" | tr '"' "'" | sed ':a;N;$!ba;s/\n/^n/g')
 
-  cat <<EOF |sed "s/^  //g" > /boot/config/plugins/preclear.disk/$(( $RANDOM * $RANDOM * $RANDOM )).sreport
+  cat <<EOF |sed "s/^  //g" > "${PC_REPORT_DIR}/$(( $RANDOM * $RANDOM * $RANDOM )).sreport"
 
   [report]
   url = "https://docs.google.com/forms/d/e/1FAIpQLSfIzz2yKJknHCrrpw3KmUjlNhbYabDoECq_vVe9XyFeE_gs-w/formResponse"
@@ -2059,7 +1890,6 @@ append display_step ""
 erase_disk=n
 erase_preclear=n
 initial_bytes=0
-verify_mbr_only=n
 refresh_period=30
 append canvas 'width'  '123'
 append canvas 'height' '20'
@@ -2073,9 +1903,9 @@ ng_smart_long=y
 notify_channel=0
 notify_freq=0
 opts_long="frequency:,notify:,skip-preread,skip-postread,read-size:,write-size:,read-blocks:,test,no-stress,list,"
-opts_long+="cycles:,signature,verify,no-prompt,version,preclear-only,format-html,erase,erase-clear,load-file:,unassigned",pipeline-ng,no-signature,badblocks-blocksize:,badblocks-patterns:,smart-long
+opts_long+="cycles:,no-prompt,version,format-html,erase,erase-clear,load-file:,unassigned",pipeline-ng,no-signature,badblocks-blocksize:,badblocks-patterns:,smart-long
 
-OPTS=$(getopt -o f:n:sSr:w:b:tdlc:ujvomera:U \
+OPTS=$(getopt -o f:n:sSr:w:b:tdlc:jvmera:U \
       --long $opts_long -n "$(basename $0)" -- "$@")
 
 if [ "$?" -ne "0" ]; then
@@ -2096,13 +1926,8 @@ while true ; do
     -t|--test)           short_test=y;                        shift 1;;
     -d|--no-stress)      read_stress=n;                       shift 1;;
     -l|--list)           list_device_names;                   exit 0;;
-    -c|--cycles)         is_numeric cycles         "$1" "$2"; shift 2;;
-    -u|--signature)      verify_disk_mbr=y;                   shift 1;;
-    -p|--verify)         verify_disk_mbr=y;  verify_zeroed=y; shift 1;;
     -j|--no-prompt)      no_prompt=y;                         shift 1;;
-    -v|--version)        echo "$0 version: $version";         exit 0;;
-    -o|--preclear-only)  write_disk_mbr=y;                    shift 1;;
-    -m|--format-html)    format_html=y;                       shift 1;;
+    -v|--version)        echo "$0 version: $version";         exit 0;;-m|--format-html)    format_html=y;                       shift 1;;
     -e|--erase)          erase_disk=y;                        shift 1;;
     -r|--erase-clear)    erase_preclear=y;                    shift 1;;
     -a|--load-file)      load_file="$2";                      shift 2;;
@@ -2112,14 +1937,13 @@ while true ; do
     --no-signature)      ng_no_signature=y;                  shift 1;;
     --badblocks-blocksize) ng_badblocks_bsz="$2";            shift 2;;
     --badblocks-patterns)  ng_badblocks_patterns="$2";       shift 2;;
-    --smart-long)        ng_smart_long=y;                    shift 1;;
---resume-ng)        NG_RESUME_NG="y";                   shift 1;;
---temp-disable)     NG_TEMP_ENABLE="n";                 shift 1;;
---temp-pause)       NG_TEMP_PAUSE_C="$2";               shift 2;;
---temp-resume)      NG_TEMP_RESUME_C="$2";              shift 2;;
---temp-abort)       NG_TEMP_ABORT_C="$2";               shift 2;;
---temp-interval)    NG_TEMP_POLL_S="$2";                shift 2;;
-    --temp-fail-min)   NG_TEMP_FAIL_MIN="$2";           shift 2;;
+    --smart-long)        ng_smart_long=y;                    shift 1;;    --resume-ng)        NG_RESUME_NG="y";                   shift 1;;
+    --temp-disable)     NG_TEMP_ENABLE="n";                 shift 1;;
+    --temp-pause)       NG_TEMP_PAUSE_C="$2"; NG_TEMP_USER_SET="y"; shift 2;;
+    --temp-resume)      NG_TEMP_RESUME_C="$2"; NG_TEMP_USER_SET="y"; shift 2;;
+    --temp-abort)       NG_TEMP_ABORT_C="$2"; NG_TEMP_USER_SET="y"; shift 2;;
+    --temp-interval)    NG_TEMP_POLL_S="$2";                shift 2;;
+    --temp-fail-min)    NG_TEMP_FAIL_MIN="$2"; NG_TEMP_USER_SET="y"; shift 2;;
 
 
     --) shift ; break ;;
@@ -2169,10 +1993,7 @@ append arguments 'read_blocks'       "$read_blocks"
 append arguments 'short_test'        "$short_test"
 append arguments 'read_stress'       "$read_stress"
 append arguments 'cycles'            "$cycles"
-append arguments 'verify_disk_mbr'   "$verify_disk_mbr"
-append arguments 'verify_zeroed'     "$verify_zeroed"
 append arguments 'no_prompt'         "$no_prompt"
-append arguments 'write_disk_mbr'    "$write_disk_mbr"
 append arguments 'format_html'       "$format_html"
 append arguments 'erase_disk'        "$erase_disk"
 append arguments 'erase_preclear'    "$erase_preclear"
@@ -2374,11 +2195,11 @@ fi
 
 if ! is_preclear_candidate $theDisk; then
   tput reset
-  echo -e "\n${bold}The disk '$theDisk' is part of unRAID's array, or is assigned as a cache device.${norm}"
+  echo -e "\n${bold}The disk '$theDisk' is part of preclear array, or is assigned as a cache device.${norm}"
   echo -e "\nPlease choose another one from below:\n"
   list_device_names
   echo -e "\n"
-  debug "Disk $theDisk is part of unRAID array. Aborted."
+  debug "Disk $theDisk is part of Pi array. Aborted."
   do_exit 1
 fi
 
@@ -2394,119 +2215,17 @@ fi
 [ "$disable_smart" != "y" ] && output_smart $theDisk "$smart_type"
 
 ######################################################
-##              VERIFY PRECLEAR STATUS              ##
-######################################################
-
-if [ "$verify_disk_mbr" == "y" ]; then
-  max_steps=1
-  if [ "$verify_zeroed" == "y" ]; then
-    max_steps=2
-  fi
-
-  # update elapsed time
-  time_elapsed main && time_elapsed cycle 
-
-  append display_title "${ul}unRAID Server: verifying Preclear State of disk ${noul} ${bold}${disk_properties['serial']}${norm}."
-  append display_title "Verifying disk '${disk_properties['serial']}' for unRAID's Preclear State."
-
-  # if ! is_current_op "zeroed"; then
-
-  display_status "Verifying unRAID's signature on the MBR ..." ""
-  debug "verifying unRAID's signature on the MBR ..."
-  echo "${disk_properties[name]}|NN|Verifying unRAID's signature on the MBR...|$$" > ${all_files[stat]}
-  sleep 5
-
-  if verify_mbr $theDisk; then
-    append display_step "Verifying unRAID's Preclear MBR:|***SUCCESS***"
-    debug "success - Unraid preclear signature valid!"
-    echo "${disk_properties[name]}|NN|Verifying unRAID's signature on the MBR successful|$$" > ${all_files[stat]}
-    display_status
-  else
-    append display_step "Verifying unRAID's signature:| ***FAIL***"
-    echo "${disk_properties[name]}|NY|Verifying unRAID's signature on the MBR failed|$$" > ${all_files[stat]}
-    debug "fail - Unraid preclear signature invalid!"
-    display_status
-    echo -e "--> RESULT: FAIL! $theDisk DOESN'T have a valid unRAID MBR signature!!!\n\n"
-    if [ "$notify_channel" -gt 0 ]; then
-      send_mail "FAIL! $diskName (${disk_properties[name]}) DOESN'T have a valid unRAID MBR signature!!!" "$diskName (${disk_properties[name]}) DOESN'T have a valid unRAID MBR signature!!!" "$diskName (${disk_properties[name]}) DOESN'T have a valid unRAID MBR signature!!!" "" "alert"
-    fi
-    do_exit 1
-  fi
-  
-  # update elapsed time
-  time_elapsed main && time_elapsed cycle 
-  
-  # else
-  #   append display_step "Verifying unRAID's Preclear MBR:|***SUCCESS***"
-  #   echo "${disk_properties[name]}|NN|Verifying unRAID's signature on the MBR successful|$$" > ${all_files[stat]}
-  #   display_status
-  # fi
-
-  if [ "$max_steps" -eq "2" ]; then
-    display_status "Verifying if disk is zeroed ..." ""
-
-    # Check current operation if restoring a previous preclear instance
-    if is_current_op "zeroed"; then
-
-      # Loading restored position
-      if [ -n "$current_pos" ]; then
-        start_bytes=$current_pos
-        start_timer=$current_timer
-        current_pos=0
-      else
-        start_bytes=0
-        current_timer=0
-      fi
-
-      debug "verifying if disk is zeroed..." > ${all_files[stat]}
-
-      if read_entire_disk verify zeroed start_bytes start_timer preread_average preread_speed; then
-        append display_step "Verifying if disk is zeroed:|${preread_average} ***SUCCESS***"
-        debug "success - the disk is zeroed!"
-        echo "${disk_properties[name]}|NN|Verifying if disk is zeroed: SUCCESS|$$" > ${all_files[stat]}
-        display_status
-        sleep 10
-      else
-        append display_step "Verifying if disk is zeroed:|***FAIL***"
-        debug "fail - the disk is NOT zeroed!"
-        echo "${disk_properties[name]}|NY|Verifying if disk is zeroed: FAIL|$$" > ${all_files[stat]}
-        display_status
-        echo -e "--> RESULT: FAIL! $diskName ($theDisk) IS NOT zeroed!!!\n\n"
-        if [ "$notify_channel" -gt 0 ]; then
-          send_mail "FAIL! $diskName (${disk_properties[name]}) IS NOT zeroed!!!" "FAIL! $diskName (${disk_properties[name]}) IS NOT zeroed!!!" "FAIL! $diskName (${disk_properties[name]}) IS NOT zeroed!!!" "" "alert"
-        fi
-        do_exit 1
-      fi
-    fi
-  fi
-
-  # update elapsed time
-  time_elapsed main && time_elapsed cycle 
-  
-  if [ "$notify_channel" -gt 0 ]; then
-    send_mail "Disk $diskName (${disk_properties[name]}) is precleared!" "Disk $diskName (${disk_properties[name]}) is precleared!" "Disk $diskName (${disk_properties[name]}) is precleared!"
-  fi
-  echo "${disk_properties[name]}|NN|The disk is Precleared!|$$" > ${all_files[stat]}
-  echo -e "--> RESULT: SUCCESS! Disk ${disk_properties['serial']} is precleared!\n\n"
-  do_exit
-fi
-
-######################################################
 ##               WRITE PRECLEAR STATUS              ##
 ######################################################
 
 # ask
-append display_title "${ul}unRAID Server Pre-Clear of disk${noul} ${bold}$theDisk${norm}"
+append display_title "${ul}Pi Pre-Clear of disk${noul} ${bold}$theDisk${norm}"
 
 if [ "$no_prompt" != "y" ]; then
   ask_preclear
   tput clear
 fi
 
-if [ "$write_disk_mbr" == "y" ]; then
-  write_signature 64
-  exit 0
-fi
 
 ######################################################
 ##                 PRECLEAR THE DISK                ##
@@ -2542,7 +2261,7 @@ for cycle in $(seq $cycles); do
   # Reset canvas
   unset display_title
   unset display_step && append display_step ""
-  append display_title "${ul}unRAID Server ${op_title} of disk${noul} ${bold}${disk_properties['serial']}${norm}"
+  append display_title "${ul}Pi ${op_title} of disk${noul} ${bold}${disk_properties['serial']}${norm}"
 
   if [ "$erase_disk" == "y" ]; then
     append display_title "Cycle ${bold}${cycle}$norm of ${cycles}."
@@ -2745,66 +2464,6 @@ for cycle in $(seq $cycles); do
   else
     append display_step "${title_write} the disk:|[${write_average}] ***SUCCESS***"
     display_status
-  fi
-
-  if [ "$erase_disk" != "y" ]; then
-
-    # Write unRAID's preclear signature to the disk
-    # Check current operation if restoring a previous preclear instance
-    if is_current_op "write_mbr"; then
-
-      # update elapsed time
-      time_elapsed main && time_elapsed cycle 
-
-      display_status "Writing unRAID's Preclear signature to the disk ..." ''
-      diskop+=([current_op]="write_mbr" [current_pos]="0" [current_timer]="0" )
-      save_current_status
-      echo "${disk_properties[name]}|NN|Writing unRAID's Preclear signature|$$" > ${all_files[stat]}
-      write_signature 64
-      # sleep 10
-      append display_step "Writing unRAID's Preclear signature:|***SUCCESS***"
-      echo "${disk_properties[name]}|NN|Writing unRAID's Preclear signature finished|$$" > ${all_files[stat]}
-      # sleep 10
-    else
-      append display_step "Writing unRAID's Preclear signature:|***SUCCESS***"
-      display_status
-    fi
-
-    # Verify unRAID's preclear signature in disk
-    # Check current operation if restoring a previous preclear instance
-    if is_current_op "read_mbr"; then
-      display_status "Verifying unRAID's signature on the MBR ..." ""
-      diskop+=([current_op]="read_mbr" [current_pos]="0" [current_timer]="0" )
-      save_current_status
-      echo "${disk_properties[name]}|NN|Verifying unRAID's signature on the MBR|$$" > ${all_files[stat]}
-      debug "Signature: verifying unRAID's signature on the MBR ..."
-
-      if verify_mbr $theDisk; then
-        append display_step "Verifying unRAID's Preclear signature:|***SUCCESS*** "
-        display_status
-        debug "Signature: Unraid preclear signature is valid!"
-        echo "${disk_properties[name]}|NN|unRAID's signature on the MBR is valid|$$" > ${all_files[stat]}
-      else
-        append display_step "Verifying unRAID's Preclear signature:|***FAIL*** "
-        debug "Signature: Unraid preclear signature is invalid!"
-        echo -e "--> FAIL: unRAID's Preclear signature is invalid. \n\n"
-        echo "${disk_properties[name]}|NY|unRAID's signature on the MBR failed - Aborted|$$" > ${all_files[stat]}
-        send_mail "FAIL! Invalid unRAID's MBR signature on $diskName (${disk_properties[name]})" "FAIL! Invalid unRAID's MBR signature on $diskName (${disk_properties[name]})." "Invalid unRAID's MBR signature on $diskName (${disk_properties[name]}) - Aborted" "" "alert"
-        save_report  "No - Invalid unRAID's MBR signature." "$preread_speed" "$postread_speed" "$write_speed"
-        debug_smart $theDisk "$smart_type" "Error:"
-        display_status
-        wait $!
-
-        do_exit 1
-      fi
-    else
-      append display_step "Verifying unRAID's Preclear signature:|***SUCCESS*** "
-      display_status
-    fi
-
-    # update elapsed time
-    time_elapsed main && time_elapsed cycle
-
   fi
 
   # Do a post-read if not skipped
@@ -3341,10 +3000,32 @@ ng_certificate() {
 # -------------------------------
 # Temperature abort safety (NG)
 # -------------------------------
+
+ng_apply_drive_temp_defaults() {
+  # Only apply auto defaults if the user did not override with --temp-*
+  [[ "${NG_TEMP_USER_SET}" == "y" ]] && return 0
+
+  local dev="$1"
+  local rota=""
+  rota=$(lsblk -dn -o ROTA "$dev" 2>/dev/null | head -n1 || true)
+
+  if [[ "$rota" == "0" ]]; then
+    # SSD defaults
+    NG_TEMP_PAUSE_C=60
+    NG_TEMP_RESUME_C=55
+    NG_TEMP_ABORT_C=70
+  else
+    # HDD defaults
+    NG_TEMP_PAUSE_C=50
+    NG_TEMP_RESUME_C=45
+    NG_TEMP_ABORT_C=58
+  fi
+}
 NG_TEMP_ENABLE="y"
-NG_TEMP_PAUSE_C=45
-NG_TEMP_RESUME_C=42
-NG_TEMP_ABORT_C=50
+NG_TEMP_USER_SET="n"
+NG_TEMP_PAUSE_C=50
+NG_TEMP_RESUME_C=45
+NG_TEMP_ABORT_C=58
 NG_TEMP_POLL_S=15
 NG_TEMP_FAIL_MIN=30   # hard FAIL if time above pause temp exceeds this many minutes (0 disables)
 
@@ -3416,9 +3097,10 @@ run_pipeline_ng() {
 
   NG_SERIAL="$(lsblk -dn -o SERIAL "$NG_DISK" 2>/dev/null | head -n1)"
   NG_MODEL="$(lsblk -dn -o MODEL "$NG_DISK" 2>/dev/null | head -n1)"
+  ng_apply_drive_temp_defaults "$NG_DISK"
   [[ -z "$NG_SERIAL" ]] && NG_SERIAL="$(basename "$NG_DISK")"
 # Resume/state file (now that serial is known)
-  # Pi/Universal state + outputs (avoid Unraid USB flash paths)
+  # Pi/Universal state + outputs (avoid Pi USB flash paths)
   NG_USER="${SUDO_USER:-$USER}"
   NG_USER_HOME="$(getent passwd "$NG_USER" 2>/dev/null | cut -d: -f6)"
   [[ -z "$NG_USER_HOME" ]] && NG_USER_HOME="$HOME"
