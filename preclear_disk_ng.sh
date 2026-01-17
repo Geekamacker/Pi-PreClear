@@ -1946,6 +1946,60 @@ reason=${reason}
 ts=$(date -Is)
 EOF
 }
+ng_state_set() {
+  # Convenience wrapper used by the NG pipeline.
+  # Writes a small state file so a run can be resumed if interrupted.
+  local step_num="$1"
+  local step_name="$2"
+
+  case "${step_name}" in
+    "" )
+      case "${step_num}" in
+        1) step_name="pre-read" ;;
+        2) step_name="badblocks" ;;
+        3) step_name="smart-long" ;;
+        4) step_name="zero" ;;
+        5) step_name="post-read" ;;
+        6) step_name="complete" ;;
+        *) step_name="step-${step_num}" ;;
+      esac
+      ;;
+  esac
+
+  ng_state_write "${step_num}" "${step_name}" "running"
+}
+
+ng_step_thermal_reset() {
+  # Reset per-step thermal counters/min/max before starting a pipeline step.
+  NG_STEP_TEMP_MIN=""
+  NG_STEP_TEMP_MAX=""
+  NG_TEMP_STEP_ABOVE_PAUSE_SECONDS=0
+  NG_TEMP_STEP_PAUSED_SECONDS=0
+  NG_TEMP_STEP_ABORTED=0
+  NG_TEMP_STEP_PAUSED=0
+}
+
+ng_step_thermal_finalize() {
+  # Capture per-step thermal summary after finishing a step.
+  local step_num="$1"
+  local step_label="$2"
+
+  local step_min="${NG_STEP_TEMP_MIN:-}"
+  local step_max="${NG_STEP_TEMP_MAX:-}"
+  local above_min=$(( ${NG_TEMP_STEP_ABOVE_PAUSE_SECONDS:-0} / 60 ))
+  local paused_min=$(( ${NG_TEMP_STEP_PAUSED_SECONDS:-0} / 60 ))
+
+  [[ -z "${step_min}" ]] && step_min="n/a"
+  [[ -z "${step_max}" ]] && step_max="n/a"
+
+  NG_THERM_MIN["${step_num}"]="${step_min}"
+  NG_THERM_MAX["${step_num}"]="${step_max}"
+  NG_THERM_ABOVE_MIN["${step_num}"]="${above_min}"
+  NG_THERM_PAUSED_MIN["${step_num}"]="${paused_min}"
+
+  # Also keep a human-readable log snippet for the certificate.
+  NG_THERM_SUMMARY+=$'Step '"${step_num}"$' ('"${step_label}"$'): min='"${step_min}"$'C max='"${step_max}"$'C above-pause='"${above_min}"$'m paused='"${paused_min}"$'m\n'
+}
 
 ng_state_clear() {
   [[ -n "${NG_STATE_FILE}" ]] && rm -f "${NG_STATE_FILE}" 2>/dev/null || true
@@ -2405,7 +2459,7 @@ ng_certificate() {
     echo "SMART after:  ${NG_SMART_AFTER}"
     echo "####################################################################################################################"
   } > "$cert"
-  echo "THERMAL SUMMARY: ${NG_THERM_SUMMARY}" >> "$out"
+  echo "THERMAL SUMMARY: ${NG_THERM_SUMMARY}" >> "$cert"
 }
 
 
