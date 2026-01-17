@@ -58,51 +58,21 @@ trim() {
 # Pi / universal additions
 # ------------------------------
 is_unraid() {
-  [[ -f /etc/unraid-version || -d /usr/local/emhttp ]] && return 0 || return 1
+  return 1
 }
 
 pc_base_dir() {
-  # Prefer Unraid flash paths when available; otherwise use /var/lib/preclear-ng
-  if is_unraid && [[ -d /boot && -w /boot ]]; then
-    echo "/boot"
-  else
-    echo "/var/lib/preclear-ng"
-  fi
+  echo "/var/lib/preclear-ng"
 }
 
 PC_BASE="$(pc_base_dir)"
-PC_PLUGIN_DIR="${PC_BASE}/config/plugins/preclear.disk"
+PC_PLUGIN_DIR="${PC_BASE}/pi-preclear"
 PC_REPORT_DIR="${PC_BASE}/preclear_reports"
 PC_TMP_DIR="/tmp/.preclear"
 mkdir -p "${PC_PLUGIN_DIR}" "${PC_REPORT_DIR}" "${PC_TMP_DIR}" 2>/dev/null || true
-list_unraid_disks(){
-  local _result=$1
-  local i=0
-  # Get flash disk device
-  unraid_disks[$i]=$(readlink -f /dev/disk/by-label/UNRAID|grep -Po "[^\d]*")
-
-  # Grab cache disks using disks.cfg file
-  if [ -f "/boot/config/disk.cfg" ]
-  then
-    while read line ; do
-      if [ -n "$line" ]; then
-        let "i+=1" 
-        unraid_disks[$i]=$(find /dev/disk/by-id/ -type l -iname "*-$line*" ! -iname "*-part*"| xargs readlink -f)
-      fi
-    done < <(cat /boot/config/disk.cfg|grep 'cacheId'|grep -Po '=\"\K[^\"]*')
-  fi
-
-  # Get array disks using super.dat id's
-  if [ -f "/var/local/emhttp/disks.ini" ]; then
-    while read line; do
-      disk="/dev/${line}"
-      if [ -n "$disk" ]; then
-        let "i+=1"
-        unraid_disks[$i]=$(readlink -f $disk)
-      fi
-    done < <(cat /var/local/emhttp/disks.ini | grep -Po 'device="\K[^"]*')
-  fi
-  eval "$_result=(${unraid_disks[@]})"
+list_unraid_disks() {
+  # Pi-only build: no Unraid array detection.
+  eval "$1=()"
 }
 
 list_all_disks(){
@@ -113,81 +83,64 @@ list_all_disks(){
   done
   eval "$_result=(${all_disks[@]})"
 }
-
 is_preclear_candidate () {
-  list_unraid_disks unraid_disks
-  part=($(comm -12 <(for X in "${unraid_disks[@]}"; do echo "${X}"; done|sort)  <(echo $1)))
-  if [ ${#part[@]} -eq 0 ] && [ $(cat /proc/mounts|grep -Poc "^${1}") -eq 0 ]
-  then
-    return 0
-  else
+  local disk="$1"
+  [[ -b "$disk" ]] || return 1
+
+  # Refuse if the disk OR any of its partitions are mounted.
+  if lsblk -nro MOUNTPOINTS "$disk" 2>/dev/null | grep -qE '\S'; then
     return 1
   fi
+
+  # Refuse if this is the root disk (extra safety).
+  local root_src
+  root_src=$(findmnt -nro SOURCE / 2>/dev/null || true)
+  if [[ -n "$root_src" ]] && [[ "$disk" == "${root_src%[0-9]*}" ]]; then
+    return 1
+  fi
+
+  return 0
 }
 
 # list the disks that are not assigned to the array. They are the possible drives to pre-clear
+# list disks that are NOT mounted (candidates)
 list_device_names() {
-  echo "====================================$ver"
-  echo " Disks not assigned to the unRAID array "
-  echo "  (potential candidates for clearing) "
   echo "========================================"
-  list_unraid_disks unraid_disks
-  list_all_disks all_disks
-  unassigned=($(comm -23 <(for X in "${all_disks[@]}"; do echo "${X}"; done|sort)  <(for X in "${unraid_disks[@]}"; do echo "${X}"; done|sort)))
+  echo " Disks not currently mounted"
+  echo " (potential candidates for preclear)"
+  echo "========================================"
 
-  if [ ${#unassigned[@]} -gt 0 ]
-  then
-    for disk in "${unassigned[@]}"
-    do
-      if [ $(cat /proc/mounts|grep -Poc "^${disk}") -eq 0 ]
-      then
-        serial=$(udevadm info --query=property --path $(udevadm info -q path -n $disk 2>/dev/null) 2>/dev/null|grep -Po "ID_SERIAL=\K.*")
-        echo "     ${disk} = ${serial}"
-      fi
-    done
-  else
-    echo "No un-assigned disks detected."
-  fi
+  local name disk serial model size mnts
+  while read -r name; do
+    disk="/dev/$name"
+    # Skip loop/zram/rom/mmc
+    [[ "$name" =~ ^(loop|zram|sr|mmcblk) ]] && continue
+
+    # Only consider whole disks
+    [[ -b "$disk" ]] || continue
+
+    mnts=$(lsblk -nro MOUNTPOINTS "$disk" 2>/dev/null | tr -d '\r')
+    [[ -n "$mnts" ]] && continue
+
+    size=$(lsblk -dnro SIZE "$disk" 2>/dev/null)
+    model=$(udevadm info --query=property --name="$disk" 2>/dev/null | sed -n 's/^ID_MODEL=//p' | head -n1)
+    serial=$(udevadm info --query=property --name="$disk" 2>/dev/null | sed -n 's/^ID_SERIAL_SHORT=//p' | head -n1)
+
+    printf "  %s = %s %s (%s)
+" "$disk" "${size:-?}" "${model:-unknown}" "${serial:-no-serial}"
+  done < <(lsblk -dnro NAME,TYPE 2>/dev/null | awk '$2=="disk"{print $1}')
 }
-
 list_unassigned_disks() {
-  list_unraid_disks unraid_disks
-  list_all_disks all_disks
-  unassigned=($(comm -23 <(for X in "${all_disks[@]}"; do echo "${X}"; done|sort)  <(for X in "${unraid_disks[@]}"; do echo "${X}"; done|sort)))
-
-  if [ ${#unassigned[@]} -gt 0 ]
-  then
-    for disk in "${unassigned[@]}"
-    do
-      if [ $(cat /proc/mounts|grep -Poc "^${disk}") -eq 0 ]
-      then
-        serial=$(udevadm info --query=property --path $(udevadm info -q path -n $disk 2>/dev/null) 2>/dev/null|grep -Po "ID_SERIAL=\K.*")
-        name=$(basename $disk)
-        echo "$name = $serial"
-      fi
-    done
-  fi
+  # Kept for backward-compatibility with older docs/flags.
+  # On Pi, "unassigned" means "not mounted".
+  list_device_names
 }
 
-# gfjardim - add notification system capability without breaking legacy mail.
+# Notifications are optional on Pi; by default this is a no-op unless a notify script exists.
 send_mail() {
-  subject=$(echo ${1})
-  description=$(echo ${2})
-  message=$(echo ${3})
-  recipient=${4}
-  if [ -n "${5}" ]; then
-    importance="${5}"
-  else
-    importance="normal"
-  fi
-  if [ -f "/usr/local/sbin/notify" ]; then # unRAID 6.0
-    notify_script="/usr/local/sbin/notify"
-  elif [ -f "/usr/local/emhttp/plugins/dynamix/scripts/notify" ]; then # unRAID 6.1
-    notify_script="/usr/local/emhttp/plugins/dynamix/scripts/notify"
-  else # unRAID pre 6.0
-    return 1
-  fi
-  $notify_script -e "Preclear on ${disk_properties[serial]}" -s """${subject}""" -d """${description}""" -m """${message}""" -i "${importance} ${notify_channel}"
+  # Pi-only build: notification integration is optional.
+  # If you want notifications, implement this function to call mail/telegram/etc.
+  return 0
 }
 
 append() {
@@ -336,8 +289,8 @@ verify_mbr() {
       fi
       ;;
     *)
-      echo "Failed test 3: start sector is different from those accepted by unRAID."
-      debug "Signature: failed test 3: start sector is different from those accepted by unRAID."
+      echo "Failed test 3: start sector is different from those accepted by Pi."
+      debug "Signature: failed test 3: start sector is different from those accepted by Pi."
       array_enumerate2 sectors
       ;;
   esac
@@ -1796,87 +1749,13 @@ get_disk_temp() {
 }
 
 save_report() {
-  local success=$1
-  local preread_speed=${2:-"n/a"}
-  local postread_speed=${3:-"n/a"}
-  local zeroing_speed=${4:-"n/a"}
-  local controller=${disk_properties[controller]}
-  local log_entry=$log_prefix
-  local size=$(numfmt --to=si --suffix=B --format='%1.f' --round=nearest ${disk_properties[size]})
-  local model=${disk_properties[model]}
-  local time=$(time_elapsed main display)
-  local smart=${disk_properties[smart_type]}
-  local form_out=${all_files[form_out]}
-  local title="Preclear Disk<br>Send Anonymous Statistics"
-
-  local text="Send <span style='font-weight:bold;'>anonymous</span> statistics (using Google Forms) to the developer, helping on bug fixes, "
-  text+="performance tunning and usage statistics that will be open to the community. For detailed information, please visit the "
-  text+="<a href='http://lime-technology.com/forum/index.php?topic=39985.0'>support forum topic</a>."
-
-  local log=$(cat "/var/log/preclear.disk.log" | grep -Po "${log_entry} \K.*" | tr '"' "'" | sed ':a;N;$!ba;s/\n/^n/g')
-
-  cat <<EOF |sed "s/^  //g" > /boot/config/plugins/preclear.disk/$(( $RANDOM * $RANDOM * $RANDOM )).sreport
-
-  [report]
-  url = "https://docs.google.com/forms/d/e/1FAIpQLSfIzz2yKJknHCrrpw3KmUjlNhbYabDoECq_vVe9XyFeE_gs-w/formResponse"
-  title = "${title}"
-  text = "${text}"
-
-  [model]
-  entry = 'entry.1754350191'
-  title = "Disk Model"
-  value = "${model}"
-
-  [size]
-  entry = 'entry.1497914868'
-  title = "Disk Size"
-  value = "${size}"
-
-  [controller]
-  entry = 'entry.2002415860'
-  title = 'Disk Controller'
-  value = "${controller}"
-
-  [preread]
-  entry  = 'entry.2099803197'
-  title = "Pre-Read Average Speed"
-  value = ${preread_speed}
-
-  [postread]
-  entry = 'entry.1410821652'
-  title = "Post-Read Average Speed"
-  value = "${postread_speed}"
-
-  [zeroing]
-  entry  = 'entry.1433994509'
-  title = "Zeroing Average Speed"
-  value = "${zeroing_speed}"
-
-  [cycles]
-  entry = "entry.765505609"
-  title = "Cycles"
-  value = "${cycles}"
-
-  [time]
-  entry = 'entry.899329837'
-  title = "Total Elapsed Time"
-  value = "${time}"
-
-  [smart]
-  entry = 'entry.1973215494'
-  title = "SMART Device Type"
-  value = ${smart}
-
-  [success]
-  entry = 'entry.704369346'
-  title = "Success"
-  value = "${success}"
-
-  [log]
-  entry = 'entry.1470248957'
-  title = "Log"
-  value = "${log}"
-EOF
+  # Pi-only build: store report locally (no Unraid flash paths).
+  local report_file="$1"
+  local dest_dir="${PC_REPORT_DIR:-/var/lib/preclear-ng/preclear_reports}"
+  mkdir -p "$dest_dir" 2>/dev/null || true
+  if [[ -f "$report_file" ]]; then
+    cp -f "$report_file" "$dest_dir/" 2>/dev/null || true
+  fi
 }
 
 debug_smart()
@@ -2047,6 +1926,731 @@ done
 ##                                                  ##
 ######################################################
 
+#Defaut values
+all_timer_diff=0
+cycle_timer_diff=0
+main_elapsed_time=0
+cycle_elapsed_time=0
+command=$(echo "$0 $@")
+read_stress=y
+cycles=1
+append display_step ""
+erase_disk=n
+erase_preclear=n
+initial_bytes=0
+refresh_period=30
+append canvas 'width'  '123'
+append canvas 'height' '20'
+append canvas 'brick'  '#'
+smart_type=auto
+pipeline_ng=n
+ng_no_signature=y
+ng_badblocks_patterns="0xaa,0x55,0xff,0x00"
+ng_badblocks_bsz=""
+ng_smart_long=y
+notify_channel=0
+notify_freq=0
+opts_long="frequency:,notify:,skip-preread,skip-postread,read-size:,write-size:,read-blocks:,test,no-stress,list,"
+opts_long+="cycles:,no-prompt,version,format-html,erase,erase-clear,load-file:,unassigned",pipeline-ng,no-signature,badblocks-blocksize:,badblocks-patterns:,smart-long
+
+OPTS=$(getopt -o f:n:sSr:w:b:tdlc:ujvomera:U \
+      --long $opts_long -n "$(basename $0)" -- "$@")
+
+if [ "$?" -ne "0" ]; then
+  exit 1
+fi
+
+eval set -- "$OPTS"
+# (set -o >/dev/null; set >/tmp/.init)
+while true ; do
+  case "$1" in
+    -f|--frequency)      is_numeric notify_freq    "$1" "$2"; shift 2;;
+    -n|--notify)         is_numeric notify_channel "$1" "$2"; shift 2;;
+    -s|--skip-preread)   skip_preread=y;                      shift 1;;
+    -S|--skip-postread)  skip_postread=y;                     shift 1;;
+    -r|--read-size)      is_numeric read_size      "$1" "$2"; shift 2;;
+    -w|--write-size)     is_numeric write_size     "$1" "$2"; shift 2;;
+    -b|--read-blocks)    is_numeric read_blocks    "$1" "$2"; shift 2;;
+    -t|--test)           short_test=y;                        shift 1;;
+    -d|--no-stress)      read_stress=n;                       shift 1;;
+    -l|--list)           list_device_names;                   exit 0;;
+    -c|--cycles)         is_numeric cycles         "$1" "$2"; shift 2;;
+    -j|--no-prompt)      no_prompt=y;                         shift 1;;
+    -v|--version)        echo "$0 version: $version";         exit 0;;
+    -m|--format-html)    format_html=y;                       shift 1;;
+    -e|--erase)          erase_disk=y;                        shift 1;;
+    -r|--erase-clear)    erase_preclear=y;                    shift 1;;
+    -a|--load-file)      load_file="$2";                      shift 2;;
+    -U|--unassigned)     list_unassigned_disks;               exit 0;;
+
+    --pipeline-ng)       pipeline_ng=y;                      shift 1;;
+    --no-signature)      ng_no_signature=y;                  shift 1;;
+    --badblocks-blocksize) ng_badblocks_bsz="$2";            shift 2;;
+    --badblocks-patterns)  ng_badblocks_patterns="$2";       shift 2;;
+    --smart-long)        ng_smart_long=y;                    shift 1;;
+--resume-ng)        NG_RESUME_NG="y";                   shift 1;;
+--temp-disable)     NG_TEMP_ENABLE="n";                 shift 1;;
+--temp-pause)       NG_TEMP_PAUSE_C="$2";               shift 2;;
+--temp-resume)      NG_TEMP_RESUME_C="$2";              shift 2;;
+--temp-abort)       NG_TEMP_ABORT_C="$2";               shift 2;;
+--temp-interval)    NG_TEMP_POLL_S="$2";                shift 2;;
+    --temp-fail-min)   NG_TEMP_FAIL_MIN="$2";           shift 2;;
+
+
+    --) shift ; break ;;
+    * ) echo "Internal error!" ; exit 1 ;;
+  esac
+done
+
+if [ ! -b "$1" ]; then
+  echo "Disk not set, please verify the command arguments."
+  debug "Disk not set, please verify the command arguments."
+  exit 1
+fi
+
+theDisk=$(echo $1|trim)
+
+# If requested, run the Pi/universal Preclear-NG pipeline and exit.
+if [[ "${pipeline_ng}" == "y" ]]; then
+  run_pipeline_ng "$theDisk"
+  exit $?
+fi
+
+debug "Command: $command"
+debug "Preclear Disk Version: ${version}"
+
+# Restoring session or exit if it's not possible
+if [ -f "$load_file" ] && $(bash -n "$load_file"); then
+  debug "Restoring previous instance of preclear"
+  . "$load_file"
+  if [ "$all_timer_diff" -gt 0 ]; then
+    main_elapsed_time=$all_timer_diff
+    cycle_elapsed_time=$cycle_timer_diff
+  fi
+  if [ "$main_elapsed_time" -eq 0 ]; then
+    debug "Resume failed, please start a new instance of preclear"
+    echo "$(basename $theDisk)|NN|Resume failed!|${script_pid}" > "/tmp/preclear_stat_$(basename $theDisk)"
+    exit 1
+  fi
+fi
+
+append arguments 'notify_freq'       "$notify_freq"
+append arguments 'notify_channel'    "$notify_channel"
+append arguments 'skip_preread'      "$skip_preread"
+append arguments 'skip_postread'     "$skip_postread"
+append arguments 'read_size'         "$read_size"
+append arguments 'write_size'        "$write_size"
+append arguments 'read_blocks'       "$read_blocks"
+append arguments 'short_test'        "$short_test"
+append arguments 'read_stress'       "$read_stress"
+append arguments 'cycles'            "$cycles"
+append arguments 'no_prompt'         "$no_prompt"
+append arguments 'format_html'       "$format_html"
+append arguments 'erase_disk'        "$erase_disk"
+append arguments 'erase_preclear'    "$erase_preclear"
+
+# diff /tmp/.init <(set -o >/dev/null; set)
+# exit 0
+######################################################
+##                                                  ##
+##          SET DEFAULT PROGRAM VARIABLES           ##
+##                                                  ##
+######################################################
+
+# Operation variables
+append diskop 'current_op' ""
+append diskop 'current_pos' ""
+append diskop 'current_timer' ""
+append diskop 'last_update' 0
+append diskop 'update_interval' "120"
+
+# Disk properties
+append disk_properties 'device'      "$theDisk"
+append disk_properties 'size'        $(blockdev --getsize64 ${disk_properties[device]} 2>/dev/null)
+append disk_properties 'block_sz'    $(blockdev --getpbsz ${disk_properties[device]} 2>/dev/null)
+append disk_properties 'blocks'      $(( ${disk_properties[size]} / ${disk_properties[block_sz]} ))
+append disk_properties 'blocks_512'  $(blockdev --getsz ${disk_properties[device]} 2>/dev/null)
+append disk_properties 'name'        $(basename ${disk_properties[device]} 2>/dev/null)
+append disk_properties 'parts'       $(grep -c "${disk_properties[name]}[0-9]" /proc/partitions 2>/dev/null)
+append disk_properties 'serial_long' $(udevadm info --query=property --name ${disk_properties[device]} 2>/dev/null|grep -Po 'ID_SERIAL=\K.*')
+append disk_properties 'serial'      $(udevadm info --query=property --name ${disk_properties[device]} 2>/dev/null|grep -Po 'ID_SERIAL_SHORT=\K.*')
+append disk_properties 'smart_type'  "default"
+
+disk_controller=$(udevadm info --query=property --name ${disk_properties[device]} | grep -Po 'DEVPATH.*0000:\K[^/]*')
+append disk_properties 'controller'  "$(lspci | grep -Po "${disk_controller}[^:]*: \K.*")"
+
+if [ "${disk_properties[parts]}" -gt 0 ]; then
+  for part in $(seq 1 "${disk_properties[parts]}" ); do
+    let "parts+=($(blockdev --getsize64 ${disk_properties[device]}${part} 2>/dev/null) / ${disk_properties[block_sz]})"
+  done
+  append disk_properties 'start_sector' $(( ${disk_properties[blocks]} - $parts ))
+else
+  append disk_properties 'start_sector' "0"
+fi
+
+# Disable read_stress if preclearing a SSD
+eval $( lsblk -nbP --nodeps -o ROTA $theDisk )
+if [ "$ROTA" -eq 0 ]; then 
+  debug "Disk ${theDisk} is a SSD, disabling head stress test." 
+  read_stress=n
+fi
+
+# Test suitable device type for SMART, and disable it if not found.
+disable_smart=y
+for type in "" scsi ata auto sat,auto sat,12 usbsunplus usbcypress usbjmicron usbjmicron,x test "sat -T permissive" usbjmicron,p sat,16; do
+  if [ -n "$type" ]; then
+    type="-d $type"
+  fi
+  smartInfo=$(timeout -s 9 30 smartctl --all $type "$theDisk" 2>/dev/null)
+  if [[ $smartInfo == *"START OF INFORMATION SECTION"* ]]; then
+
+    smart_type=$type
+
+    if [ -z "$type" ]; then
+      type='default'
+    fi
+
+    debug "S.M.A.R.T. info type: ${type}"
+
+    append disk_properties 'smart_type' "$type"
+
+    if [[ $smartInfo == *"Reallocated_Sector_Ct"* ]]; then
+      debug "S.M.A.R.T. attrs type: ${type}"
+      disable_smart=n
+    fi
+    
+    while read line ; do
+      if [[ $line =~ Model\ Family:\ (.*) ]]; then
+        append disk_properties 'family' "$(echo "${BASH_REMATCH[1]}"|xargs)"
+      elif [[ $line =~ Device\ Model:\ (.*) ]]; then
+        append disk_properties 'model' "$(echo "${BASH_REMATCH[1]}"|xargs)"
+      elif [[ $line =~ User\ Capacity:\ (.*) ]]; then
+        append disk_properties 'size_human' "$(echo "${BASH_REMATCH[1]}"|xargs)"
+      elif [[ $line =~ Firmware\ Version:\ (.*) ]]; then
+        append disk_properties 'firmware' "$(echo "${BASH_REMATCH[1]}"|xargs)"
+      elif [[ $line =~ Vendor:\ (.*) ]]; then
+        append disk_properties 'vendor' "$(echo "${BASH_REMATCH[1]}"|xargs)"
+      elif [[ $line =~ Product:\ (.*) ]]; then
+        append disk_properties 'product' "$(echo "${BASH_REMATCH[1]}"|xargs)"
+      fi
+    done < <(echo -n "$smartInfo")
+
+    if [ -z "${disk_properties[model]}" ] && [ -n "${disk_properties[vendor]}" ] && [ -n "${disk_properties[product]}" ]; then
+      append disk_properties 'model' "${disk_properties[vendor]} ${disk_properties[product]}"
+    fi
+
+    append disk_properties 'temp' "$(get_disk_temp $theDisk "$smart_type")"
+
+    break
+  fi
+done
+
+debug "Disk size: ${disk_properties[size]}"
+debug "Disk blocks: ${disk_properties[blocks]}"
+debug "Blocks (512 bytes): ${disk_properties[blocks_512]}"
+debug "Block size: ${disk_properties[block_sz]}"
+debug "Start sector: ${disk_properties[start_sector]}"
+
+# Used files
+append all_files 'dir'           "/tmp/.preclear/${disk_properties[name]}"
+append all_files 'dd_out'        "${all_files[dir]}/dd_output"
+append all_files 'dd_exit'       "${all_files[dir]}/dd_exit_code"
+append all_files 'dd_pid'        "${all_files[dir]}/dd_pid"
+append all_files 'cmp_out'       "${all_files[dir]}/cmp_out"
+append all_files 'blkpid'        "${all_files[dir]}/blkpid"
+append all_files 'fifo'          "${all_files[dir]}/fifo"
+append all_files 'pause'         "${all_files[dir]}/pause"
+append all_files 'queued'        "${all_files[dir]}/queued"
+append all_files 'verify_errors' "${all_files[dir]}/verify_errors"
+append all_files 'pid'           "${all_files[dir]}/pid"
+append all_files 'stat'          "/tmp/preclear_stat_${disk_properties[name]}"
+append all_files 'smart_prefix'  "${all_files[dir]}/smart_"
+append all_files 'smart_final'   "${all_files[dir]}/smart_final"
+append all_files 'smart_out'     "${all_files[dir]}/smart_out"
+append all_files 'form_out'      "${all_files[dir]}/form_out"
+append all_files 'resume_file'   "${PC_PLUGIN_DIR}/${disk_properties[serial]}.resume"
+append all_files 'resume_temp'   "/tmp/.preclear/${disk_properties[serial]}.resume"
+append all_files 'wait'          "${all_files[dir]}/wait"
+
+mkdir -p "${all_files[dir]}"
+
+trap_with_arg "do_exit 0" INT TERM EXIT SIGKILL
+
+if [ ! -p "${all_files[fifo]}" ]; then
+  mkfifo "${all_files[fifo]}" || exit
+fi
+
+# Set terminal variables
+if [ "$format_html" == "y" ]; then
+  clearscreen=`tput clear`
+  goto_top=`tput cup 0 1`
+  screen_line_three=`tput cup 3 1`
+  bold="&lt;b&gt;"
+  norm="&lt;/b&gt;"
+  ul="&lt;span style=\"text-decoration: underline;\"&gt;"
+  noul="&lt;/span&gt;"
+elif [ -x /usr/bin/tput ]; then
+  clearscreen=`tput clear`
+  goto_top=`tput cup 0 1`
+  screen_line_three=`tput cup 3 1`
+  bold=`tput smso`
+  norm=`tput rmso`
+  ul=`tput smul`
+  noul=`tput rmul`
+else
+  clearscreen=`echo -n -e "\033[H\033[2J"`
+  goto_top=`echo -n -e "\033[1;2H"`
+  screen_line_three=`echo -n -e "\033[4;2H"`
+  bold=`echo -n -e "\033[7m"`
+  norm=`echo -n -e "\033[27m"`
+  ul=`echo -n -e "\033[4m"`
+  noul=`echo -n -e "\033[24m"`
+fi
+
+# set the default canvas
+# draw_canvas $canvas_height $canvas_width >/dev/null
+
+# Mail disk name
+if [ -n "${disk_properties[serial]}" ]; then
+  diskName="${disk_properties[serial]}"
+else
+  diskName="${disk_properties[name]}"
+fi
+
+# set init timer or reset timer
+time_elapsed main set $main_elapsed_time
+time_elapsed cycle set $cycle_elapsed_time
+
+######################################################
+##                                                  ##
+##                MAIN PROGRAM BLOCK                ##
+##                                                  ##
+######################################################
+
+# Verify if it's already running
+if [ -f "${all_files[pid]}" ]; then
+  pid=$(cat ${all_files[pid]})
+  if [ -e "/proc/${pid}" ]; then
+    echo "An instance of Preclear for disk '$theDisk' is already running."
+    debug "An instance of Preclear for disk '$theDisk' is already running."
+    trap '' EXIT
+    exit 1
+  else
+    echo "$script_pid" > ${all_files[pid]}
+  fi
+else
+  echo "$script_pid" > ${all_files[pid]}
+fi
+
+# keep_pid_updated &
+
+if ! is_preclear_candidate $theDisk; then
+  tput reset
+  echo -e "\n${bold}The disk '$theDisk' appears to be mounted/in-use. Refusing to run on an active disk.${norm}"
+  echo -e "\nPlease choose another one from below:\n"
+  list_device_names
+  echo -e "\n"
+  debug "Disk $theDisk appears mounted/in-use. Aborted."
+  do_exit 1
+fi
+
+echo "${disk_properties[name]}|NN|Starting...|${script_pid}" > "/tmp/preclear_stat_${disk_properties[name]}"
+
+if [ -z "$current_op" ] || [ ! -f "${all_files[smart_prefix]}cycle_initial_start" ]; then
+  # Export initial SMART status
+  [ "$disable_smart" != "y" ] && save_smart_info $theDisk "$smart_type" "cycle_initial_start"
+fi
+
+# Add current SMART status to display_smart
+[ "$disable_smart" != "y" ] && compare_smart "cycle_initial_start"
+[ "$disable_smart" != "y" ] && output_smart $theDisk "$smart_type"
+
+######################################################
+##               WRITE PRECLEAR STATUS              ##
+######################################################
+
+# ask
+append display_title "${ul}Pi-PreClear Pre-Clear of disk${noul} ${bold}$theDisk${norm}"
+
+if [ "$no_prompt" != "y" ]; then
+  ask_preclear
+  tput clear
+fi
+
+# write_disk_mbr (signature) removed for Pi-only build
+
+######################################################
+##                 PRECLEAR THE DISK                ##
+######################################################
+
+
+if [ "$erase_disk" == "y" ]; then
+  op_title="Erase"
+  title_write="Erasing"
+  write_op="erase"
+else
+  op_title="Preclear"
+  title_write="Zeroing"
+  write_op="zero"
+fi
+
+retries=5
+
+for cycle in $(seq $cycles); do
+  # Continue to next cycle if restoring new-session
+  if [ -n "$current_op" ] && [ "$cycle" != "$current_cycle" ]; then
+    debug "skipping cycle ${cycle}."
+    continue
+  fi
+
+  if [ -z "$current_pos" ]; then
+    time_elapsed cycle set 0
+  fi
+
+  # update elapsed time
+  time_elapsed main && time_elapsed cycle
+
+  # Reset canvas
+  unset display_title
+  unset display_step && append display_step ""
+  append display_title "${ul}Pi-PreClear ${op_title} of disk${noul} ${bold}${disk_properties['serial']}${norm}"
+
+  if [ "$erase_disk" == "y" ]; then
+    append display_title "Cycle ${bold}${cycle}$norm of ${cycles}."
+  else
+    append display_title "Cycle ${bold}${cycle}$norm of ${cycles}, partition start sector: 64 (legacy default)."
+  fi
+  
+  # Adjust the number of steps
+  if [ "$erase_disk" == "y" ]; then
+    max_steps=4
+
+    # Disable pre-read and post-read if erasing
+    skip_preread="y"
+    skip_postread="y"
+  else
+    max_steps=4
+  fi
+
+  if [ "$skip_preread" == "y" ]; then
+    let max_steps-=1
+  fi
+  if [ "$skip_postread" == "y" ]; then
+    let max_steps-=1
+  fi
+  if [ "$erase_preclear" != "y" ]; then
+    let max_steps-=1
+  fi
+
+  # Export initial SMART status
+  [ "$disable_smart" != "y" ] && save_smart_info $theDisk "$smart_type" "cycle_${cycle}_start"
+
+  # Do a preread if not skipped
+  if [ "$skip_preread" != "y" ]; then
+
+    # Check current operation if restoring a previous preclear instance
+    if is_current_op "preread"; then
+
+      # Loading restored position
+      if [ -n "$current_pos" ]; then
+        start_bytes=$current_pos
+        start_timer=$current_timer
+        current_pos=0
+      else
+        start_bytes=0
+        current_timer=0
+      fi
+
+      # Updating display status 
+      display_status "Pre-Read in progress ..." ''
+
+      # Saving progress  
+      diskop+=([current_op]="preread" [current_pos]="$start_bytes" [current_timer]="$start_timer" )
+      save_current_status
+
+
+      for x in $(seq 1 $retries); do
+        # update elapsed time
+        time_elapsed main && time_elapsed cycle
+        debug "Pre-read: pre-read verification started ($x/$retries)...."
+        
+        read_entire_disk no-verify preread start_bytes start_timer preread_average preread_speed
+        ret_val=$?
+        if [ "$ret_val" -eq 0 ]; then
+          append display_step "Pre-read verification:|[${preread_average}] ***SUCCESS***"
+          debug "Pre-read: pre-read verification completed!"
+          display_status
+          break
+        elif [ "$ret_val" -eq 2 -a "$x" -lt $retries ]; then
+          debug "dd process hung at ${start_bytes}, killing...."
+          continue
+        else
+          append display_step "Pre-read verification:|${bold}FAIL${norm}"
+          debug "Pre-read: pre-read verification failed!"
+          echo "${disk_properties[name]}|NY|Pre-read failed - Aborted|$$" > ${all_files[stat]}
+          send_mail "FAIL! Pre-read $diskName (${disk_properties[name]}) failed" "FAIL! Pre-read $diskName (${disk_properties[name]}) failed." "Pre-read $diskName (${disk_properties[name]}) failed - Aborted" "" "alert"
+          echo -e "--> FAIL: Result: Pre-Read failed.\n\n"
+          save_report "No - Pre-read $diskName (${disk_properties[name]}) failed." "$preread_speed" "$postread_speed" "$write_speed"
+          debug_smart $theDisk "$smart_type"  "Error:"
+          display_status
+          wait $!
+
+          do_exit 1
+        fi
+      done
+    else
+      append display_step "Pre-read verification:|[${preread_average}] ***SUCCESS***"
+      display_status
+    fi
+  fi
+
+  # update elapsed time
+  time_elapsed main && time_elapsed cycle 
+
+  # Erase the disk in erase-clear op
+  if [ "$erase_preclear" == "y" ]; then
+
+    # Check current operation if restoring a previous preclear instance
+    if is_current_op "erase"; then
+
+      # Loading restored position
+      if [ -n "$current_pos" ]; then
+        start_bytes=$current_pos
+        start_timer=$current_timer
+        current_pos=""
+      else
+        start_bytes=0
+        start_timer=0
+      fi
+
+      display_status "Erasing in progress ..." ''
+      diskop+=([current_op]="erase" [current_pos]="$start_bytes" [current_timer]="$start_timer" )
+      save_current_status
+
+      # Erase the disk
+      for x in $(seq 1 $retries); do
+
+        # update elapsed time
+        time_elapsed main && time_elapsed cycle 
+        debug "Erasing: erasing the disk started ($x/$retries)...."
+
+        write_disk erase start_bytes start_timer write_average write_speed
+        ret_val=$?
+        if [ "$ret_val" -eq 0 ]; then
+          debug "Erasing: erasing the disk completed!"
+          append display_step "Erasing the disk:|[${write_average}] ***SUCCESS***"
+          display_status
+          break
+        elif [ "$ret_val" -eq 2 -a "$x" -lt $retries ]; then
+          debug "dd process hung at ${start_bytes}, killing...."
+          continue
+        else
+          append display_step "Erasing the disk:|${bold}FAIL${norm}"
+          debug "Erasing: erasing the disk failed!"
+          echo "${disk_properties[name]}|NY|Erasing failed - Aborted|$$" > ${all_files[stat]}
+          send_mail "FAIL! Erasing $diskName (${disk_properties[name]}) failed" "FAIL! Erasing $diskName (${disk_properties[name]}) failed." "Erasing $diskName (${disk_properties[name]}) failed - Aborted" "" "alert"
+          echo -e "--> FAIL: Result: Erasing the disk failed.\n\n"
+          save_report "No - Erasing the disk failed." "$preread_speed" "$postread_speed" "$write_speed"
+          debug_smart $theDisk "$smart_type"  "Error:"
+          display_status
+          wait $!
+
+          do_exit 1
+        fi
+      done
+    else
+      append display_step "Erasing the disk:|[${write_average}] ***SUCCESS***"
+      display_status
+    fi
+  fi
+
+  # update elapsed time
+  time_elapsed main && time_elapsed cycle 
+
+  # Erase/Zero the disk
+  # Check current operation if restoring a previous preclear instance
+  if is_current_op "$write_op"; then
+    
+    # Loading restored position
+    if [ -n "$current_pos" ]; then
+      start_bytes=$current_pos
+      start_timer=$current_timer
+      current_pos=""
+    else
+      start_bytes=0
+      start_timer=0
+    fi
+
+    display_status "${title_write} in progress ..." ''
+    diskop+=([current_op]="$write_op" [current_pos]="$start_bytes" [current_timer]="$start_timer" )
+    save_current_status
+
+    for x in $(seq 1 $retries); do
+      # update elapsed time
+      time_elapsed main && time_elapsed cycle 
+      debug "${title_write}: ${title_write,,} the disk started ($x/$retries)...."
+
+      write_disk $write_op start_bytes start_timer write_average write_speed
+      ret_val=$?
+      if [ "$ret_val" -eq 0 ]; then
+        append display_step "${title_write} the disk:|[${write_average}] ***SUCCESS***"
+        debug "${title_write}: ${title_write,,} the disk completed!"
+        break
+      elif [ "$ret_val" -eq 2 -a "$x" -lt $retries ]; then
+        debug "dd process hung at ${start_bytes}, killing...."
+        continue
+      else
+        append display_step "${title_write} the disk:|${bold}FAIL${norm}"
+        debug "${title_write}: ${title_write,,} the disk failed!"
+        echo "${disk_properties[name]}|NY|${title_write} the disk failed - Aborted|$$" > ${all_files[stat]}
+        send_mail "FAIL! ${title_write} $diskName (${disk_properties[name]}) failed" "FAIL! ${title_write} $diskName (${disk_properties[name]}) failed." "${title_write} $diskName (${disk_properties[name]}) failed - Aborted" "" "alert"
+        echo -e "--> FAIL: Result: ${title_write} $diskName (${disk_properties[name]}) failed.\n\n"
+        save_report "No - ${title_write} the disk failed." "$preread_speed" "$postread_speed" "$write_speed"
+        debug_smart $theDisk "$smart_type" "Error:"
+        display_status
+        wait $!
+
+        do_exit 1
+      fi
+    done
+  else
+    append display_step "${title_write} the disk:|[${write_average}] ***SUCCESS***"
+    display_status
+  fi
+
+  # Do a post-read if not skipped
+  if [ "$skip_postread" != "y" ]; then
+
+    # Check current operation if restoring a previous preclear instance
+    if is_current_op "postread"; then
+
+      # Loading restored position
+      if [ -n "$current_pos" ]; then
+        start_bytes=$current_pos
+        start_timer=$current_timer
+        current_pos=""
+      else
+        start_bytes=0
+        start_timer=0
+      fi
+
+      display_status "Post-Read in progress ..." ""
+      diskop+=([current_op]="postread" [current_pos]="$start_bytes" [current_timer]="$start_timer" )
+      save_current_status
+      for x in $(seq 1 $retries); do
+        # update elapsed time
+        time_elapsed main && time_elapsed cycle
+        debug "Post-Read: post-read verification started ($x/$retries)...."
+
+        read_entire_disk verify postread start_bytes start_timer postread_average postread_speed
+        ret_val=$?
+        if [ "$ret_val" -eq 0 ]; then
+          append display_step "Post-Read verification:|[${postread_average}] ***SUCCESS*** "
+          debug "Post-Read: post-read verification completed!"
+          display_status
+          echo "${disk_properties[name]}|NY|Post-Read verification successful|$$" > ${all_files[stat]}
+          break
+        elif [ "$ret_val" -eq 2 -a "$x" -lt $retries ]; then
+          debug "dd process hung at ${start_bytes}, killing...."
+          continue
+        else
+          append display_step "Post-Read verification:| ***FAIL***"
+          debug "Post-Read: post-read verification failed!"
+          echo -e "--> FAIL: Post-Read verification failed. Your drive is not zeroed.\n\n"
+          echo "${disk_properties[name]}|NY|Post-Read failed - Aborted|$$" > ${all_files[stat]}
+          send_mail "FAIL! Post-Read $diskName (${disk_properties[name]}) failed" "FAIL! Post-Read $diskName (${disk_properties[name]}) failed." "Post-Read $diskName (${disk_properties[name]}) failed - Aborted" "" "alert"
+          save_report "No - Post-Read verification failed" "$preread_speed" "$postread_speed" "$write_speed"
+          debug_smart $theDisk "$smart_type" "Error:"
+          display_status
+          wait $!
+
+          do_exit 1
+        fi
+      done
+    fi
+  fi
+
+  # update elapsed time
+  time_elapsed main && time_elapsed cycle 
+
+  # Export final SMART status for cycle
+  [ "$disable_smart" != "y" ] && save_smart_info $theDisk "$smart_type" "cycle_${cycle}_end"
+  # Compare start/end values
+  [ "$disable_smart" != "y" ] && compare_smart "cycle_${cycle}_start" "cycle_${cycle}_end" "CYCLE $cycle"
+  # Add current SMART status to display_smart
+  [ "$disable_smart" != "y" ] && output_smart $theDisk "$smart_type"
+  display_status '' ''
+  debug_smart $theDisk "$smart_type" "Cycle $cycle"
+
+  debug "Cycle: elapsed time: $(time_elapsed cycle display)"
+
+  # Send end of the cycle notification
+  if [ "$notify_channel" -gt 0 ] && [ "$notify_freq" -ge 1 ]; then
+    if [ $cycle -eq $cycles ]; then
+      subject="Disk $diskName (${disk_properties[name]}) preclear finished!"
+      description="${op_title}: Disk $diskName (${disk_properties[name]}) preclear finished!"
+      report_out="Disk ${disk_properties[name]} has successfully finished it's preclear!\\n\\n"
+    else
+      subject="Disk $diskName (${disk_properties[name]}) PASSED cycle ${cycle}!"
+      description="${op_title}: Disk $diskName (${disk_properties[name]}) PASSED cycle ${cycle}!"
+      report_out="Disk ${disk_properties[name]} has successfully finished a preclear cycle!\\n\\n"
+      report_out+="Finished Cycle $cycle of $cycles cycles.\\n"
+    fi
+    [ "$skip_preread" != "y" ] && report_out+="Last Cycle's Pre-Read Time: $(time_elapsed preread display).\\n"
+    if [ "$erase_disk" == "y" ]; then
+      report_out+="Last Cycle's Erasing Time:  $(time_elapsed erase display).\\n"
+    else
+      report_out+="Last Cycle's Zeroing Time:  $(time_elapsed zero display).\\n"
+    fi
+    [ "$skip_postread" != "y" ] && report_out+="Last Cycle's Post-Read Time: $(time_elapsed postread display).\\n"
+    report_out+="Last Cycle's Elapsed Time: $(time_elapsed cycle display)\\n"
+    report_out+="Disk Start Temperature: ${disk_properties[temp]}\n"
+    report_out+="Disk Current Temperature: $(get_disk_temp $theDisk "$smart_type")\\n"
+    [ "$cycle" -lt "$cycles" ] && report_out+="\\nStarting a new cycle.\\n"
+
+    send_mail "$subject" "$description" "$report_out"
+  fi
+done
+
+# update elapsed time
+time_elapsed main && time_elapsed cycle
+debug "Preclear: total elapsed time: $(time_elapsed main display)"
+
+
+echo "${disk_properties[name]}|NN|${op_title} Finished Successfully!|$$" > ${all_files[stat]};
+
+if [ "$disable_smart" != "y" ]; then
+  echo -e "\n--> ATTENTION: Please take a look into the SMART report above for drive health issues.\n"
+fi
+echo -e "--> RESULT: ${op_title} Finished Successfully!.\n\n"
+
+# # Saving report
+report="${all_files[dir]}/report"
+
+# Remove resume information
+rm -f ${all_files[resume_file]}
+
+tmux_window="preclear_disk_${disk_properties[serial]}"
+if [ "$(tmux ls 2>/dev/null | grep -c "${tmux_window}")" -gt 0 ]; then
+  tmux capture-pane -t "${tmux_window}" && tmux show-buffer >$report 2>&1
+else
+  display_status '' '' >$report
+  if [ "$disable_smart" != "y" ]; then
+    echo -e "\n--> ATTENTION: Please take a look into the SMART report above for drive health issues.\n" >>$report
+  fi
+  echo -e "--> RESULT: ${op_title} Finished Successfully!\n\n" >>$report
+  report_tmux="preclear_disk_report_${disk_properties[name]}"
+
+  tmux new-session -d -x 140 -y 200 -s "${report_tmux}"
+  tmux send -t "${report_tmux}" "cat '$report'" ENTER
+  sleep 1
+
+  tmux capture-pane -t "${report_tmux}" && tmux show-buffer >$report 2>&1
+  tmux kill-session -t "${report_tmux}" >/dev/null 2>&1
+fi
+
+
+# ------------------------------
 # Preclear-NG Pipeline (Pi / universal)
 # ------------------------------
 ng_log_line() {
@@ -2449,9 +3053,9 @@ ng_certificate() {
 # Temperature abort safety (NG)
 # -------------------------------
 NG_TEMP_ENABLE="y"
-NG_TEMP_PAUSE_C=45
-NG_TEMP_RESUME_C=42
-NG_TEMP_ABORT_C=50
+NG_TEMP_PAUSE_C=50
+NG_TEMP_RESUME_C=47
+NG_TEMP_ABORT_C=55
 NG_TEMP_POLL_S=15
 NG_TEMP_FAIL_MIN=30   # hard FAIL if time above pause temp exceeds this many minutes (0 disables)
 
@@ -2525,7 +3129,7 @@ run_pipeline_ng() {
   NG_MODEL="$(lsblk -dn -o MODEL "$NG_DISK" 2>/dev/null | head -n1)"
   [[ -z "$NG_SERIAL" ]] && NG_SERIAL="$(basename "$NG_DISK")"
 # Resume/state file (now that serial is known)
-  # Pi/Universal state + outputs (avoid Unraid USB flash paths)
+  # Pi/Universal state + outputs (avoid Pi USB flash paths)
   NG_USER="${SUDO_USER:-$USER}"
   NG_USER_HOME="$(getent passwd "$NG_USER" 2>/dev/null | cut -d: -f6)"
   [[ -z "$NG_USER_HOME" ]] && NG_USER_HOME="$HOME"
@@ -2723,899 +3327,6 @@ echo "NG pipeline PASSED. Certificate: $NG_CERT"
 }
 
 
-#Defaut values
-all_timer_diff=0
-cycle_timer_diff=0
-main_elapsed_time=0
-cycle_elapsed_time=0
-command=$(echo "$0 $@")
-read_stress=y
-cycles=1
-append display_step ""
-erase_disk=n
-erase_preclear=n
-initial_bytes=0
-verify_mbr_only=n
-refresh_period=30
-append canvas 'width'  '123'
-append canvas 'height' '20'
-append canvas 'brick'  '#'
-smart_type=auto
-pipeline_ng=y
-ng_no_signature=y
-ng_badblocks_patterns="0xaa,0x55,0xff,0x00"
-ng_badblocks_bsz=""
-ng_smart_long=y
-notify_channel=0
-notify_freq=0
-opts_long+="cycles:,signature,verify,no-prompt,version,preclear-only,format-html,erase,erase-clear,load-file:,unassigned,pipeline-ng,legacy,no-signature,badblocks-blocksize:,badblocks-patterns:,smart-long,resume-ng,temp-disable,temp-pause:,temp-resume:,temp-abort:,temp-interval:,temp-fail-min:"
-
-OPTS=$(getopt -o f:n:sSr:w:b:tdlc:ujvomera:U \
-      --long $opts_long -n "$(basename $0)" -- "$@")
-
-if [ "$?" -ne "0" ]; then
-  exit 1
-fi
-
-eval set -- "$OPTS"
-# (set -o >/dev/null; set >/tmp/.init)
-while true ; do
-  case "$1" in
-    -f|--frequency)      is_numeric notify_freq    "$1" "$2"; shift 2;;
-    -n|--notify)         is_numeric notify_channel "$1" "$2"; shift 2;;
-    -s|--skip-preread)   skip_preread=y;                      shift 1;;
-    -S|--skip-postread)  skip_postread=y;                     shift 1;;
-    -r|--read-size)      is_numeric read_size      "$1" "$2"; shift 2;;
-    -w|--write-size)     is_numeric write_size     "$1" "$2"; shift 2;;
-    -b|--read-blocks)    is_numeric read_blocks    "$1" "$2"; shift 2;;
-    -t|--test)           short_test=y;                        shift 1;;
-    -d|--no-stress)      read_stress=n;                       shift 1;;
-    -l|--list)           list_device_names;                   exit 0;;
-    -c|--cycles)         is_numeric cycles         "$1" "$2"; shift 2;;
-    -u|--signature)      verify_disk_mbr=y;                   shift 1;;
-    -p|--verify)         verify_disk_mbr=y;  verify_zeroed=y; shift 1;;
-    -j|--no-prompt)      no_prompt=y;                         shift 1;;
-    -v|--version)        echo "$0 version: $version";         exit 0;;
-    -o|--preclear-only)  write_disk_mbr=y;                    shift 1;;
-    -m|--format-html)    format_html=y;                       shift 1;;
-    -e|--erase)          erase_disk=y;                        shift 1;;
-    -r|--erase-clear)    erase_preclear=y;                    shift 1;;
-    -a|--load-file)      load_file="$2";                      shift 2;;
-    -U|--unassigned)     list_unassigned_disks;               exit 0;;
-
-    --pipeline-ng)       pipeline_ng=y;                      shift 1;;
-    --legacy)            pipeline_ng=n;                      shift 1;;
-    --no-signature)      ng_no_signature=y;                  shift 1;;
-    --badblocks-blocksize) ng_badblocks_bsz="$2";            shift 2;;
-    --badblocks-patterns)  ng_badblocks_patterns="$2";       shift 2;;
-    --smart-long)        ng_smart_long=y;                    shift 1;;
---resume-ng)        NG_RESUME_NG="y";                   shift 1;;
---temp-disable)     NG_TEMP_ENABLE="n";                 shift 1;;
---temp-pause)       NG_TEMP_PAUSE_C="$2";               shift 2;;
---temp-resume)      NG_TEMP_RESUME_C="$2";              shift 2;;
---temp-abort)       NG_TEMP_ABORT_C="$2";               shift 2;;
---temp-interval)    NG_TEMP_POLL_S="$2";                shift 2;;
-    --temp-fail-min)   NG_TEMP_FAIL_MIN="$2";           shift 2;;
-
-
-    --) shift ; break ;;
-    * ) echo "Internal error!" ; exit 1 ;;
-  esac
-done
-
-if [ ! -b "$1" ]; then
-  echo "Disk not set, please verify the command arguments."
-  debug "Disk not set, please verify the command arguments."
-  exit 1
-fi
-
-theDisk=$(echo $1|trim)
-
-# If requested, run the Pi/universal Preclear-NG pipeline and exit.
-if [[ "${pipeline_ng}" == "y" ]]; then
-  run_pipeline_ng "$theDisk"
-  exit $?
-fi
-
-debug "Command: $command"
-debug "Preclear Disk Version: ${version}"
-
-# Restoring session or exit if it's not possible
-if [ -f "$load_file" ] && $(bash -n "$load_file"); then
-  debug "Restoring previous instance of preclear"
-  . "$load_file"
-  if [ "$all_timer_diff" -gt 0 ]; then
-    main_elapsed_time=$all_timer_diff
-    cycle_elapsed_time=$cycle_timer_diff
-  fi
-  if [ "$main_elapsed_time" -eq 0 ]; then
-    debug "Resume failed, please start a new instance of preclear"
-    echo "$(basename $theDisk)|NN|Resume failed!|${script_pid}" > "/tmp/preclear_stat_$(basename $theDisk)"
-    exit 1
-  fi
-fi
-
-append arguments 'notify_freq'       "$notify_freq"
-append arguments 'notify_channel'    "$notify_channel"
-append arguments 'skip_preread'      "$skip_preread"
-append arguments 'skip_postread'     "$skip_postread"
-append arguments 'read_size'         "$read_size"
-append arguments 'write_size'        "$write_size"
-append arguments 'read_blocks'       "$read_blocks"
-append arguments 'short_test'        "$short_test"
-append arguments 'read_stress'       "$read_stress"
-append arguments 'cycles'            "$cycles"
-append arguments 'verify_disk_mbr'   "$verify_disk_mbr"
-append arguments 'verify_zeroed'     "$verify_zeroed"
-append arguments 'no_prompt'         "$no_prompt"
-append arguments 'write_disk_mbr'    "$write_disk_mbr"
-append arguments 'format_html'       "$format_html"
-append arguments 'erase_disk'        "$erase_disk"
-append arguments 'erase_preclear'    "$erase_preclear"
-
-# diff /tmp/.init <(set -o >/dev/null; set)
-# exit 0
-######################################################
-##                                                  ##
-##          SET DEFAULT PROGRAM VARIABLES           ##
-##                                                  ##
-######################################################
-
-# Operation variables
-append diskop 'current_op' ""
-append diskop 'current_pos' ""
-append diskop 'current_timer' ""
-append diskop 'last_update' 0
-append diskop 'update_interval' "120"
-
-# Disk properties
-append disk_properties 'device'      "$theDisk"
-append disk_properties 'size'        $(blockdev --getsize64 ${disk_properties[device]} 2>/dev/null)
-append disk_properties 'block_sz'    $(blockdev --getpbsz ${disk_properties[device]} 2>/dev/null)
-append disk_properties 'blocks'      $(( ${disk_properties[size]} / ${disk_properties[block_sz]} ))
-append disk_properties 'blocks_512'  $(blockdev --getsz ${disk_properties[device]} 2>/dev/null)
-append disk_properties 'name'        $(basename ${disk_properties[device]} 2>/dev/null)
-append disk_properties 'parts'       $(grep -c "${disk_properties[name]}[0-9]" /proc/partitions 2>/dev/null)
-append disk_properties 'serial_long' $(udevadm info --query=property --name ${disk_properties[device]} 2>/dev/null|grep -Po 'ID_SERIAL=\K.*')
-append disk_properties 'serial'      $(udevadm info --query=property --name ${disk_properties[device]} 2>/dev/null|grep -Po 'ID_SERIAL_SHORT=\K.*')
-append disk_properties 'smart_type'  "default"
-
-disk_controller=$(udevadm info --query=property --name ${disk_properties[device]} | grep -Po 'DEVPATH.*0000:\K[^/]*')
-append disk_properties 'controller'  "$(lspci | grep -Po "${disk_controller}[^:]*: \K.*")"
-
-if [ "${disk_properties[parts]}" -gt 0 ]; then
-  for part in $(seq 1 "${disk_properties[parts]}" ); do
-    let "parts+=($(blockdev --getsize64 ${disk_properties[device]}${part} 2>/dev/null) / ${disk_properties[block_sz]})"
-  done
-  append disk_properties 'start_sector' $(( ${disk_properties[blocks]} - $parts ))
-else
-  append disk_properties 'start_sector' "0"
-fi
-
-# Disable read_stress if preclearing a SSD
-eval $( lsblk -nbP --nodeps -o ROTA $theDisk )
-if [ "$ROTA" -eq 0 ]; then 
-  debug "Disk ${theDisk} is a SSD, disabling head stress test." 
-  read_stress=n
-fi
-
-# Test suitable device type for SMART, and disable it if not found.
-disable_smart=y
-for type in "" scsi ata auto sat,auto sat,12 usbsunplus usbcypress usbjmicron usbjmicron,x test "sat -T permissive" usbjmicron,p sat,16; do
-  if [ -n "$type" ]; then
-    type="-d $type"
-  fi
-  smartInfo=$(timeout -s 9 30 smartctl --all $type "$theDisk" 2>/dev/null)
-  if [[ $smartInfo == *"START OF INFORMATION SECTION"* ]]; then
-
-    smart_type=$type
-
-    if [ -z "$type" ]; then
-      type='default'
-    fi
-
-    debug "S.M.A.R.T. info type: ${type}"
-
-    append disk_properties 'smart_type' "$type"
-
-    if [[ $smartInfo == *"Reallocated_Sector_Ct"* ]]; then
-      debug "S.M.A.R.T. attrs type: ${type}"
-      disable_smart=n
-    fi
-    
-    while read line ; do
-      if [[ $line =~ Model\ Family:\ (.*) ]]; then
-        append disk_properties 'family' "$(echo "${BASH_REMATCH[1]}"|xargs)"
-      elif [[ $line =~ Device\ Model:\ (.*) ]]; then
-        append disk_properties 'model' "$(echo "${BASH_REMATCH[1]}"|xargs)"
-      elif [[ $line =~ User\ Capacity:\ (.*) ]]; then
-        append disk_properties 'size_human' "$(echo "${BASH_REMATCH[1]}"|xargs)"
-      elif [[ $line =~ Firmware\ Version:\ (.*) ]]; then
-        append disk_properties 'firmware' "$(echo "${BASH_REMATCH[1]}"|xargs)"
-      elif [[ $line =~ Vendor:\ (.*) ]]; then
-        append disk_properties 'vendor' "$(echo "${BASH_REMATCH[1]}"|xargs)"
-      elif [[ $line =~ Product:\ (.*) ]]; then
-        append disk_properties 'product' "$(echo "${BASH_REMATCH[1]}"|xargs)"
-      fi
-    done < <(echo -n "$smartInfo")
-
-    if [ -z "${disk_properties[model]}" ] && [ -n "${disk_properties[vendor]}" ] && [ -n "${disk_properties[product]}" ]; then
-      append disk_properties 'model' "${disk_properties[vendor]} ${disk_properties[product]}"
-    fi
-
-    append disk_properties 'temp' "$(get_disk_temp $theDisk "$smart_type")"
-
-    break
-  fi
-done
-
-debug "Disk size: ${disk_properties[size]}"
-debug "Disk blocks: ${disk_properties[blocks]}"
-debug "Blocks (512 bytes): ${disk_properties[blocks_512]}"
-debug "Block size: ${disk_properties[block_sz]}"
-debug "Start sector: ${disk_properties[start_sector]}"
-
-# Used files
-append all_files 'dir'           "/tmp/.preclear/${disk_properties[name]}"
-append all_files 'dd_out'        "${all_files[dir]}/dd_output"
-append all_files 'dd_exit'       "${all_files[dir]}/dd_exit_code"
-append all_files 'dd_pid'        "${all_files[dir]}/dd_pid"
-append all_files 'cmp_out'       "${all_files[dir]}/cmp_out"
-append all_files 'blkpid'        "${all_files[dir]}/blkpid"
-append all_files 'fifo'          "${all_files[dir]}/fifo"
-append all_files 'pause'         "${all_files[dir]}/pause"
-append all_files 'queued'        "${all_files[dir]}/queued"
-append all_files 'verify_errors' "${all_files[dir]}/verify_errors"
-append all_files 'pid'           "${all_files[dir]}/pid"
-append all_files 'stat'          "/tmp/preclear_stat_${disk_properties[name]}"
-append all_files 'smart_prefix'  "${all_files[dir]}/smart_"
-append all_files 'smart_final'   "${all_files[dir]}/smart_final"
-append all_files 'smart_out'     "${all_files[dir]}/smart_out"
-append all_files 'form_out'      "${all_files[dir]}/form_out"
-append all_files 'resume_file'   "${PC_PLUGIN_DIR}/${disk_properties[serial]}.resume"
-append all_files 'resume_temp'   "/tmp/.preclear/${disk_properties[serial]}.resume"
-append all_files 'wait'          "${all_files[dir]}/wait"
-
-mkdir -p "${all_files[dir]}"
-
-trap_with_arg "do_exit 0" INT TERM EXIT SIGKILL
-
-if [ ! -p "${all_files[fifo]}" ]; then
-  mkfifo "${all_files[fifo]}" || exit
-fi
-
-# Set terminal variables
-if [ "$format_html" == "y" ]; then
-  clearscreen=`tput clear`
-  goto_top=`tput cup 0 1`
-  screen_line_three=`tput cup 3 1`
-  bold="&lt;b&gt;"
-  norm="&lt;/b&gt;"
-  ul="&lt;span style=\"text-decoration: underline;\"&gt;"
-  noul="&lt;/span&gt;"
-elif [ -x /usr/bin/tput ]; then
-  clearscreen=`tput clear`
-  goto_top=`tput cup 0 1`
-  screen_line_three=`tput cup 3 1`
-  bold=`tput smso`
-  norm=`tput rmso`
-  ul=`tput smul`
-  noul=`tput rmul`
-else
-  clearscreen=`echo -n -e "\033[H\033[2J"`
-  goto_top=`echo -n -e "\033[1;2H"`
-  screen_line_three=`echo -n -e "\033[4;2H"`
-  bold=`echo -n -e "\033[7m"`
-  norm=`echo -n -e "\033[27m"`
-  ul=`echo -n -e "\033[4m"`
-  noul=`echo -n -e "\033[24m"`
-fi
-
-# set the default canvas
-# draw_canvas $canvas_height $canvas_width >/dev/null
-
-# Mail disk name
-if [ -n "${disk_properties[serial]}" ]; then
-  diskName="${disk_properties[serial]}"
-else
-  diskName="${disk_properties[name]}"
-fi
-
-# set init timer or reset timer
-time_elapsed main set $main_elapsed_time
-time_elapsed cycle set $cycle_elapsed_time
-
-######################################################
-##                                                  ##
-##                MAIN PROGRAM BLOCK                ##
-##                                                  ##
-######################################################
-
-# Verify if it's already running
-if [ -f "${all_files[pid]}" ]; then
-  pid=$(cat ${all_files[pid]})
-  if [ -e "/proc/${pid}" ]; then
-    echo "An instance of Preclear for disk '$theDisk' is already running."
-    debug "An instance of Preclear for disk '$theDisk' is already running."
-    trap '' EXIT
-    exit 1
-  else
-    echo "$script_pid" > ${all_files[pid]}
-  fi
-else
-  echo "$script_pid" > ${all_files[pid]}
-fi
-
-# keep_pid_updated &
-
-if ! is_preclear_candidate $theDisk; then
-  tput reset
-  echo -e "\n${bold}The disk '$theDisk' is part of unRAID's array, or is assigned as a cache device.${norm}"
-  echo -e "\nPlease choose another one from below:\n"
-  list_device_names
-  echo -e "\n"
-  debug "Disk $theDisk is part of unRAID array. Aborted."
-  do_exit 1
-fi
-
-echo "${disk_properties[name]}|NN|Starting...|${script_pid}" > "/tmp/preclear_stat_${disk_properties[name]}"
-
-if [ -z "$current_op" ] || [ ! -f "${all_files[smart_prefix]}cycle_initial_start" ]; then
-  # Export initial SMART status
-  [ "$disable_smart" != "y" ] && save_smart_info $theDisk "$smart_type" "cycle_initial_start"
-fi
-
-# Add current SMART status to display_smart
-[ "$disable_smart" != "y" ] && compare_smart "cycle_initial_start"
-[ "$disable_smart" != "y" ] && output_smart $theDisk "$smart_type"
-
-######################################################
-##              VERIFY PRECLEAR STATUS              ##
-######################################################
-
-if [ "$verify_disk_mbr" == "y" ]; then
-  max_steps=1
-  if [ "$verify_zeroed" == "y" ]; then
-    max_steps=2
-  fi
-
-  # update elapsed time
-  time_elapsed main && time_elapsed cycle 
-
-  append display_title "${ul}unRAID Server: verifying Preclear State of disk ${noul} ${bold}${disk_properties['serial']}${norm}."
-  append display_title "Verifying disk '${disk_properties['serial']}' for unRAID's Preclear State."
-
-  # if ! is_current_op "zeroed"; then
-
-  display_status "Verifying unRAID's signature on the MBR ..." ""
-  debug "verifying unRAID's signature on the MBR ..."
-  echo "${disk_properties[name]}|NN|Verifying unRAID's signature on the MBR...|$$" > ${all_files[stat]}
-  sleep 5
-
-  if verify_mbr $theDisk; then
-    append display_step "Verifying unRAID's Preclear MBR:|***SUCCESS***"
-    debug "success - Unraid preclear signature valid!"
-    echo "${disk_properties[name]}|NN|Verifying unRAID's signature on the MBR successful|$$" > ${all_files[stat]}
-    display_status
-  else
-    append display_step "Verifying unRAID's signature:| ***FAIL***"
-    echo "${disk_properties[name]}|NY|Verifying unRAID's signature on the MBR failed|$$" > ${all_files[stat]}
-    debug "fail - Unraid preclear signature invalid!"
-    display_status
-    echo -e "--> RESULT: FAIL! $theDisk DOESN'T have a valid unRAID MBR signature!!!\n\n"
-    if [ "$notify_channel" -gt 0 ]; then
-      send_mail "FAIL! $diskName (${disk_properties[name]}) DOESN'T have a valid unRAID MBR signature!!!" "$diskName (${disk_properties[name]}) DOESN'T have a valid unRAID MBR signature!!!" "$diskName (${disk_properties[name]}) DOESN'T have a valid unRAID MBR signature!!!" "" "alert"
-    fi
-    do_exit 1
-  fi
-  
-  # update elapsed time
-  time_elapsed main && time_elapsed cycle 
-  
-  # else
-  #   append display_step "Verifying unRAID's Preclear MBR:|***SUCCESS***"
-  #   echo "${disk_properties[name]}|NN|Verifying unRAID's signature on the MBR successful|$$" > ${all_files[stat]}
-  #   display_status
-  # fi
-
-  if [ "$max_steps" -eq "2" ]; then
-    display_status "Verifying if disk is zeroed ..." ""
-
-    # Check current operation if restoring a previous preclear instance
-    if is_current_op "zeroed"; then
-
-      # Loading restored position
-      if [ -n "$current_pos" ]; then
-        start_bytes=$current_pos
-        start_timer=$current_timer
-        current_pos=0
-      else
-        start_bytes=0
-        current_timer=0
-      fi
-
-      debug "verifying if disk is zeroed..." > ${all_files[stat]}
-
-      if read_entire_disk verify zeroed start_bytes start_timer preread_average preread_speed; then
-        append display_step "Verifying if disk is zeroed:|${preread_average} ***SUCCESS***"
-        debug "success - the disk is zeroed!"
-        echo "${disk_properties[name]}|NN|Verifying if disk is zeroed: SUCCESS|$$" > ${all_files[stat]}
-        display_status
-        sleep 10
-      else
-        append display_step "Verifying if disk is zeroed:|***FAIL***"
-        debug "fail - the disk is NOT zeroed!"
-        echo "${disk_properties[name]}|NY|Verifying if disk is zeroed: FAIL|$$" > ${all_files[stat]}
-        display_status
-        echo -e "--> RESULT: FAIL! $diskName ($theDisk) IS NOT zeroed!!!\n\n"
-        if [ "$notify_channel" -gt 0 ]; then
-          send_mail "FAIL! $diskName (${disk_properties[name]}) IS NOT zeroed!!!" "FAIL! $diskName (${disk_properties[name]}) IS NOT zeroed!!!" "FAIL! $diskName (${disk_properties[name]}) IS NOT zeroed!!!" "" "alert"
-        fi
-        do_exit 1
-      fi
-    fi
-  fi
-
-  # update elapsed time
-  time_elapsed main && time_elapsed cycle 
-  
-  if [ "$notify_channel" -gt 0 ]; then
-    send_mail "Disk $diskName (${disk_properties[name]}) is precleared!" "Disk $diskName (${disk_properties[name]}) is precleared!" "Disk $diskName (${disk_properties[name]}) is precleared!"
-  fi
-  echo "${disk_properties[name]}|NN|The disk is Precleared!|$$" > ${all_files[stat]}
-  echo -e "--> RESULT: SUCCESS! Disk ${disk_properties['serial']} is precleared!\n\n"
-  do_exit
-fi
-
-######################################################
-##               WRITE PRECLEAR STATUS              ##
-######################################################
-
-# ask
-append display_title "${ul}unRAID Server Pre-Clear of disk${noul} ${bold}$theDisk${norm}"
-
-if [ "$no_prompt" != "y" ]; then
-  ask_preclear
-  tput clear
-fi
-
-if [ "$write_disk_mbr" == "y" ]; then
-  write_signature 64
-  exit 0
-fi
-
-######################################################
-##                 PRECLEAR THE DISK                ##
-######################################################
-
-
-if [ "$erase_disk" == "y" ]; then
-  op_title="Erase"
-  title_write="Erasing"
-  write_op="erase"
-else
-  op_title="Preclear"
-  title_write="Zeroing"
-  write_op="zero"
-fi
-
-retries=5
-
-for cycle in $(seq $cycles); do
-  # Continue to next cycle if restoring new-session
-  if [ -n "$current_op" ] && [ "$cycle" != "$current_cycle" ]; then
-    debug "skipping cycle ${cycle}."
-    continue
-  fi
-
-  if [ -z "$current_pos" ]; then
-    time_elapsed cycle set 0
-  fi
-
-  # update elapsed time
-  time_elapsed main && time_elapsed cycle
-
-  # Reset canvas
-  unset display_title
-  unset display_step && append display_step ""
-  append display_title "${ul}unRAID Server ${op_title} of disk${noul} ${bold}${disk_properties['serial']}${norm}"
-
-  if [ "$erase_disk" == "y" ]; then
-    append display_title "Cycle ${bold}${cycle}$norm of ${cycles}."
-  else
-    append display_title "Cycle ${bold}${cycle}$norm of ${cycles}, partition start on sector 64."
-  fi
-  
-  # Adjust the number of steps
-  if [ "$erase_disk" == "y" ]; then
-    max_steps=4
-
-    # Disable pre-read and post-read if erasing
-    skip_preread="y"
-    skip_postread="y"
-  else
-    max_steps=6
-  fi
-
-  if [ "$skip_preread" == "y" ]; then
-    let max_steps-=1
-  fi
-  if [ "$skip_postread" == "y" ]; then
-    let max_steps-=1
-  fi
-  if [ "$erase_preclear" != "y" ]; then
-    let max_steps-=1
-  fi
-
-  # Export initial SMART status
-  [ "$disable_smart" != "y" ] && save_smart_info $theDisk "$smart_type" "cycle_${cycle}_start"
-
-  # Do a preread if not skipped
-  if [ "$skip_preread" != "y" ]; then
-
-    # Check current operation if restoring a previous preclear instance
-    if is_current_op "preread"; then
-
-      # Loading restored position
-      if [ -n "$current_pos" ]; then
-        start_bytes=$current_pos
-        start_timer=$current_timer
-        current_pos=0
-      else
-        start_bytes=0
-        current_timer=0
-      fi
-
-      # Updating display status 
-      display_status "Pre-Read in progress ..." ''
-
-      # Saving progress  
-      diskop+=([current_op]="preread" [current_pos]="$start_bytes" [current_timer]="$start_timer" )
-      save_current_status
-
-
-      for x in $(seq 1 $retries); do
-        # update elapsed time
-        time_elapsed main && time_elapsed cycle
-        debug "Pre-read: pre-read verification started ($x/$retries)...."
-        
-        read_entire_disk no-verify preread start_bytes start_timer preread_average preread_speed
-        ret_val=$?
-        if [ "$ret_val" -eq 0 ]; then
-          append display_step "Pre-read verification:|[${preread_average}] ***SUCCESS***"
-          debug "Pre-read: pre-read verification completed!"
-          display_status
-          break
-        elif [ "$ret_val" -eq 2 -a "$x" -lt $retries ]; then
-          debug "dd process hung at ${start_bytes}, killing...."
-          continue
-        else
-          append display_step "Pre-read verification:|${bold}FAIL${norm}"
-          debug "Pre-read: pre-read verification failed!"
-          echo "${disk_properties[name]}|NY|Pre-read failed - Aborted|$$" > ${all_files[stat]}
-          send_mail "FAIL! Pre-read $diskName (${disk_properties[name]}) failed" "FAIL! Pre-read $diskName (${disk_properties[name]}) failed." "Pre-read $diskName (${disk_properties[name]}) failed - Aborted" "" "alert"
-          echo -e "--> FAIL: Result: Pre-Read failed.\n\n"
-          save_report "No - Pre-read $diskName (${disk_properties[name]}) failed." "$preread_speed" "$postread_speed" "$write_speed"
-          debug_smart $theDisk "$smart_type"  "Error:"
-          display_status
-          wait $!
-
-          do_exit 1
-        fi
-      done
-    else
-      append display_step "Pre-read verification:|[${preread_average}] ***SUCCESS***"
-      display_status
-    fi
-  fi
-
-  # update elapsed time
-  time_elapsed main && time_elapsed cycle 
-
-  # Erase the disk in erase-clear op
-  if [ "$erase_preclear" == "y" ]; then
-
-    # Check current operation if restoring a previous preclear instance
-    if is_current_op "erase"; then
-
-      # Loading restored position
-      if [ -n "$current_pos" ]; then
-        start_bytes=$current_pos
-        start_timer=$current_timer
-        current_pos=""
-      else
-        start_bytes=0
-        start_timer=0
-      fi
-
-      display_status "Erasing in progress ..." ''
-      diskop+=([current_op]="erase" [current_pos]="$start_bytes" [current_timer]="$start_timer" )
-      save_current_status
-
-      # Erase the disk
-      for x in $(seq 1 $retries); do
-
-        # update elapsed time
-        time_elapsed main && time_elapsed cycle 
-        debug "Erasing: erasing the disk started ($x/$retries)...."
-
-        write_disk erase start_bytes start_timer write_average write_speed
-        ret_val=$?
-        if [ "$ret_val" -eq 0 ]; then
-          debug "Erasing: erasing the disk completed!"
-          append display_step "Erasing the disk:|[${write_average}] ***SUCCESS***"
-          display_status
-          break
-        elif [ "$ret_val" -eq 2 -a "$x" -lt $retries ]; then
-          debug "dd process hung at ${start_bytes}, killing...."
-          continue
-        else
-          append display_step "Erasing the disk:|${bold}FAIL${norm}"
-          debug "Erasing: erasing the disk failed!"
-          echo "${disk_properties[name]}|NY|Erasing failed - Aborted|$$" > ${all_files[stat]}
-          send_mail "FAIL! Erasing $diskName (${disk_properties[name]}) failed" "FAIL! Erasing $diskName (${disk_properties[name]}) failed." "Erasing $diskName (${disk_properties[name]}) failed - Aborted" "" "alert"
-          echo -e "--> FAIL: Result: Erasing the disk failed.\n\n"
-          save_report "No - Erasing the disk failed." "$preread_speed" "$postread_speed" "$write_speed"
-          debug_smart $theDisk "$smart_type"  "Error:"
-          display_status
-          wait $!
-
-          do_exit 1
-        fi
-      done
-    else
-      append display_step "Erasing the disk:|[${write_average}] ***SUCCESS***"
-      display_status
-    fi
-  fi
-
-  # update elapsed time
-  time_elapsed main && time_elapsed cycle 
-
-  # Erase/Zero the disk
-  # Check current operation if restoring a previous preclear instance
-  if is_current_op "$write_op"; then
-    
-    # Loading restored position
-    if [ -n "$current_pos" ]; then
-      start_bytes=$current_pos
-      start_timer=$current_timer
-      current_pos=""
-    else
-      start_bytes=0
-      start_timer=0
-    fi
-
-    display_status "${title_write} in progress ..." ''
-    diskop+=([current_op]="$write_op" [current_pos]="$start_bytes" [current_timer]="$start_timer" )
-    save_current_status
-
-    for x in $(seq 1 $retries); do
-      # update elapsed time
-      time_elapsed main && time_elapsed cycle 
-      debug "${title_write}: ${title_write,,} the disk started ($x/$retries)...."
-
-      write_disk $write_op start_bytes start_timer write_average write_speed
-      ret_val=$?
-      if [ "$ret_val" -eq 0 ]; then
-        append display_step "${title_write} the disk:|[${write_average}] ***SUCCESS***"
-        debug "${title_write}: ${title_write,,} the disk completed!"
-        break
-      elif [ "$ret_val" -eq 2 -a "$x" -lt $retries ]; then
-        debug "dd process hung at ${start_bytes}, killing...."
-        continue
-      else
-        append display_step "${title_write} the disk:|${bold}FAIL${norm}"
-        debug "${title_write}: ${title_write,,} the disk failed!"
-        echo "${disk_properties[name]}|NY|${title_write} the disk failed - Aborted|$$" > ${all_files[stat]}
-        send_mail "FAIL! ${title_write} $diskName (${disk_properties[name]}) failed" "FAIL! ${title_write} $diskName (${disk_properties[name]}) failed." "${title_write} $diskName (${disk_properties[name]}) failed - Aborted" "" "alert"
-        echo -e "--> FAIL: Result: ${title_write} $diskName (${disk_properties[name]}) failed.\n\n"
-        save_report "No - ${title_write} the disk failed." "$preread_speed" "$postread_speed" "$write_speed"
-        debug_smart $theDisk "$smart_type" "Error:"
-        display_status
-        wait $!
-
-        do_exit 1
-      fi
-    done
-  else
-    append display_step "${title_write} the disk:|[${write_average}] ***SUCCESS***"
-    display_status
-  fi
-
-  if [ "$erase_disk" != "y" ]; then
-
-    # Write unRAID's preclear signature to the disk
-    # Check current operation if restoring a previous preclear instance
-    if is_current_op "write_mbr"; then
-
-      # update elapsed time
-      time_elapsed main && time_elapsed cycle 
-
-      display_status "Writing unRAID's Preclear signature to the disk ..." ''
-      diskop+=([current_op]="write_mbr" [current_pos]="0" [current_timer]="0" )
-      save_current_status
-      echo "${disk_properties[name]}|NN|Writing unRAID's Preclear signature|$$" > ${all_files[stat]}
-      write_signature 64
-      # sleep 10
-      append display_step "Writing unRAID's Preclear signature:|***SUCCESS***"
-      echo "${disk_properties[name]}|NN|Writing unRAID's Preclear signature finished|$$" > ${all_files[stat]}
-      # sleep 10
-    else
-      append display_step "Writing unRAID's Preclear signature:|***SUCCESS***"
-      display_status
-    fi
-
-    # Verify unRAID's preclear signature in disk
-    # Check current operation if restoring a previous preclear instance
-    if is_current_op "read_mbr"; then
-      display_status "Verifying unRAID's signature on the MBR ..." ""
-      diskop+=([current_op]="read_mbr" [current_pos]="0" [current_timer]="0" )
-      save_current_status
-      echo "${disk_properties[name]}|NN|Verifying unRAID's signature on the MBR|$$" > ${all_files[stat]}
-      debug "Signature: verifying unRAID's signature on the MBR ..."
-
-      if verify_mbr $theDisk; then
-        append display_step "Verifying unRAID's Preclear signature:|***SUCCESS*** "
-        display_status
-        debug "Signature: Unraid preclear signature is valid!"
-        echo "${disk_properties[name]}|NN|unRAID's signature on the MBR is valid|$$" > ${all_files[stat]}
-      else
-        append display_step "Verifying unRAID's Preclear signature:|***FAIL*** "
-        debug "Signature: Unraid preclear signature is invalid!"
-        echo -e "--> FAIL: unRAID's Preclear signature is invalid. \n\n"
-        echo "${disk_properties[name]}|NY|unRAID's signature on the MBR failed - Aborted|$$" > ${all_files[stat]}
-        send_mail "FAIL! Invalid unRAID's MBR signature on $diskName (${disk_properties[name]})" "FAIL! Invalid unRAID's MBR signature on $diskName (${disk_properties[name]})." "Invalid unRAID's MBR signature on $diskName (${disk_properties[name]}) - Aborted" "" "alert"
-        save_report  "No - Invalid unRAID's MBR signature." "$preread_speed" "$postread_speed" "$write_speed"
-        debug_smart $theDisk "$smart_type" "Error:"
-        display_status
-        wait $!
-
-        do_exit 1
-      fi
-    else
-      append display_step "Verifying unRAID's Preclear signature:|***SUCCESS*** "
-      display_status
-    fi
-
-    # update elapsed time
-    time_elapsed main && time_elapsed cycle
-
-  fi
-
-  # Do a post-read if not skipped
-  if [ "$skip_postread" != "y" ]; then
-
-    # Check current operation if restoring a previous preclear instance
-    if is_current_op "postread"; then
-
-      # Loading restored position
-      if [ -n "$current_pos" ]; then
-        start_bytes=$current_pos
-        start_timer=$current_timer
-        current_pos=""
-      else
-        start_bytes=0
-        start_timer=0
-      fi
-
-      display_status "Post-Read in progress ..." ""
-      diskop+=([current_op]="postread" [current_pos]="$start_bytes" [current_timer]="$start_timer" )
-      save_current_status
-      for x in $(seq 1 $retries); do
-        # update elapsed time
-        time_elapsed main && time_elapsed cycle
-        debug "Post-Read: post-read verification started ($x/$retries)...."
-
-        read_entire_disk verify postread start_bytes start_timer postread_average postread_speed
-        ret_val=$?
-        if [ "$ret_val" -eq 0 ]; then
-          append display_step "Post-Read verification:|[${postread_average}] ***SUCCESS*** "
-          debug "Post-Read: post-read verification completed!"
-          display_status
-          echo "${disk_properties[name]}|NY|Post-Read verification successful|$$" > ${all_files[stat]}
-          break
-        elif [ "$ret_val" -eq 2 -a "$x" -lt $retries ]; then
-          debug "dd process hung at ${start_bytes}, killing...."
-          continue
-        else
-          append display_step "Post-Read verification:| ***FAIL***"
-          debug "Post-Read: post-read verification failed!"
-          echo -e "--> FAIL: Post-Read verification failed. Your drive is not zeroed.\n\n"
-          echo "${disk_properties[name]}|NY|Post-Read failed - Aborted|$$" > ${all_files[stat]}
-          send_mail "FAIL! Post-Read $diskName (${disk_properties[name]}) failed" "FAIL! Post-Read $diskName (${disk_properties[name]}) failed." "Post-Read $diskName (${disk_properties[name]}) failed - Aborted" "" "alert"
-          save_report "No - Post-Read verification failed" "$preread_speed" "$postread_speed" "$write_speed"
-          debug_smart $theDisk "$smart_type" "Error:"
-          display_status
-          wait $!
-
-          do_exit 1
-        fi
-      done
-    fi
-  fi
-
-  # update elapsed time
-  time_elapsed main && time_elapsed cycle 
-
-  # Export final SMART status for cycle
-  [ "$disable_smart" != "y" ] && save_smart_info $theDisk "$smart_type" "cycle_${cycle}_end"
-  # Compare start/end values
-  [ "$disable_smart" != "y" ] && compare_smart "cycle_${cycle}_start" "cycle_${cycle}_end" "CYCLE $cycle"
-  # Add current SMART status to display_smart
-  [ "$disable_smart" != "y" ] && output_smart $theDisk "$smart_type"
-  display_status '' ''
-  debug_smart $theDisk "$smart_type" "Cycle $cycle"
-
-  debug "Cycle: elapsed time: $(time_elapsed cycle display)"
-
-  # Send end of the cycle notification
-  if [ "$notify_channel" -gt 0 ] && [ "$notify_freq" -ge 1 ]; then
-    if [ $cycle -eq $cycles ]; then
-      subject="Disk $diskName (${disk_properties[name]}) preclear finished!"
-      description="${op_title}: Disk $diskName (${disk_properties[name]}) preclear finished!"
-      report_out="Disk ${disk_properties[name]} has successfully finished it's preclear!\\n\\n"
-    else
-      subject="Disk $diskName (${disk_properties[name]}) PASSED cycle ${cycle}!"
-      description="${op_title}: Disk $diskName (${disk_properties[name]}) PASSED cycle ${cycle}!"
-      report_out="Disk ${disk_properties[name]} has successfully finished a preclear cycle!\\n\\n"
-      report_out+="Finished Cycle $cycle of $cycles cycles.\\n"
-    fi
-    [ "$skip_preread" != "y" ] && report_out+="Last Cycle's Pre-Read Time: $(time_elapsed preread display).\\n"
-    if [ "$erase_disk" == "y" ]; then
-      report_out+="Last Cycle's Erasing Time:  $(time_elapsed erase display).\\n"
-    else
-      report_out+="Last Cycle's Zeroing Time:  $(time_elapsed zero display).\\n"
-    fi
-    [ "$skip_postread" != "y" ] && report_out+="Last Cycle's Post-Read Time: $(time_elapsed postread display).\\n"
-    report_out+="Last Cycle's Elapsed Time: $(time_elapsed cycle display)\\n"
-    report_out+="Disk Start Temperature: ${disk_properties[temp]}\n"
-    report_out+="Disk Current Temperature: $(get_disk_temp $theDisk "$smart_type")\\n"
-    [ "$cycle" -lt "$cycles" ] && report_out+="\\nStarting a new cycle.\\n"
-
-    send_mail "$subject" "$description" "$report_out"
-  fi
-done
-
-# update elapsed time
-time_elapsed main && time_elapsed cycle
-debug "Preclear: total elapsed time: $(time_elapsed main display)"
-
-
-echo "${disk_properties[name]}|NN|${op_title} Finished Successfully!|$$" > ${all_files[stat]};
-
-if [ "$disable_smart" != "y" ]; then
-  echo -e "\n--> ATTENTION: Please take a look into the SMART report above for drive health issues.\n"
-fi
-echo -e "--> RESULT: ${op_title} Finished Successfully!.\n\n"
-
-# # Saving report
-report="${all_files[dir]}/report"
-
-# Remove resume information
-rm -f ${all_files[resume_file]}
-
-tmux_window="preclear_disk_${disk_properties[serial]}"
-if [ "$(tmux ls 2>/dev/null | grep -c "${tmux_window}")" -gt 0 ]; then
-  tmux capture-pane -t "${tmux_window}" && tmux show-buffer >$report 2>&1
-else
-  display_status '' '' >$report
-  if [ "$disable_smart" != "y" ]; then
-    echo -e "\n--> ATTENTION: Please take a look into the SMART report above for drive health issues.\n" >>$report
-  fi
-  echo -e "--> RESULT: ${op_title} Finished Successfully!\n\n" >>$report
-  report_tmux="preclear_disk_report_${disk_properties[name]}"
-
-  tmux new-session -d -x 140 -y 200 -s "${report_tmux}"
-  tmux send -t "${report_tmux}" "cat '$report'" ENTER
-  sleep 1
-
-  tmux capture-pane -t "${report_tmux}" && tmux show-buffer >$report 2>&1
-  tmux kill-session -t "${report_tmux}" >/dev/null 2>&1
-fi
-
-
-# ------------------------------
 # Remove empy lines
 sed -i '/^$/{:a;N;s/\n$//;ta}' $report
 
