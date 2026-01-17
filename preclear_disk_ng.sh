@@ -1912,7 +1912,7 @@ if [ "$BV" -lt "040253" ]; then
 fi
 
 # Let's verify all dependencies
-for dep in cat awk basename blockdev comm date dd find fold getopt grep kill openssl printf readlink seq sort sum tac tmux todos tput udevadm xargs; do
+for dep in cat awk basename blockdev comm date dd find fold getopt grep kill openssl printf readlink seq sort sum tac tmux tput udevadm xargs; do
   if ! type $dep >/dev/null 2>&1 ; then
     echo -e "The following dependency isn't met: [$dep]. Please install it and try again."
     debug "The following dependency isn't met: [$dep]. Please install it and try again."
@@ -1922,6 +1922,746 @@ done
 
 ######################################################
 ##                                                  ##
+
+# ------------------------------
+# Preclear-NG Pipeline (Pi / universal)
+# (functions must be defined before option parsing triggers pipeline execution)
+# ------------------------------
+# Preclear-NG Pipeline (Pi / universal)
+# ------------------------------
+ng_log_line() {
+  local msg="$1"
+  echo "$(date '+%b %d %H:%M:%S') preclear-ng: $msg" | tee -a "$NG_LOG" >/dev/null
+}
+
+
+ng_state_write() {
+  local step_num="$1" step_name="$2" reason="$3"
+  [[ -z "${NG_STATE_FILE}" ]] && return 0
+  mkdir -p "$(dirname "${NG_STATE_FILE}")" 2>/dev/null || true
+  cat > "${NG_STATE_FILE}" <<EOF
+step_num=${step_num}
+step_name=${step_name}
+reason=${reason}
+ts=$(date -Is)
+EOF
+}
+
+ng_state_clear() {
+  [[ -n "${NG_STATE_FILE}" ]] && rm -f "${NG_STATE_FILE}" 2>/dev/null || true
+}
+
+ng_temp_read_c() {
+  [[ "${NG_TEMP_ENABLE}" != "y" ]] && { echo ""; return 0; }
+  local t
+  t="$(get_disk_temp "${NG_DISK}" "default" 2>/dev/null || true)"
+  t="${t%% *}"
+  if [[ "${t}" =~ ^[0-9]+$ ]]; then echo "${t}"; else echo ""; fi
+}
+
+ng_temp_grade() {
+  # Simple thermal risk grading for the run (not a definitive drive health verdict).
+  # Uses overall peak temp + any thermal pause/abort events.
+  local max="${NG_TEMP_MAX:-}"
+  if [[ ! "${max}" =~ ^[0-9]+$ ]]; then
+    echo "n/a"
+    return 0
+  fi
+
+  if (( NG_TEMP_ABORT_EVENTS > 0 )) || (( max >= NG_TEMP_ABORT_C )); then
+    echo "OVERHEAT (abort threshold reached)"
+  elif (( NG_TEMP_PAUSE_EVENTS > 0 )) || (( max >= NG_TEMP_PAUSE_C )); then
+    echo "HOT (hit pause threshold)"
+  elif (( max >= 45 )); then
+    echo "WARM (45C+ peak)"
+  elif (( max >= 40 )); then
+    echo "OK (40C+ peak)"
+  else
+    echo "COOL"
+  fi
+}
+
+ng_temp_update_vars() {
+  local t now dt delta ramp
+  t="$(ng_temp_read_c)"
+  if [[ -n "${t}" ]]; then
+    NG_TEMP_CUR="${t}"
+  else
+    NG_TEMP_CUR="n/a"
+    return 0
+  fi
+
+  # Stats only when numeric
+  if [[ "${NG_TEMP_CUR}" =~ ^[0-9]+$ ]]; then
+    now="$(date +%s)"
+    NG_TEMP_SAMPLE_COUNT=$((NG_TEMP_SAMPLE_COUNT + 1))
+
+    # Overall min/max
+    if [[ -z "${NG_TEMP_MIN}" ]]; then NG_TEMP_MIN="${NG_TEMP_CUR}"; fi
+    if [[ -z "${NG_TEMP_MAX}" ]]; then NG_TEMP_MAX="${NG_TEMP_CUR}"; fi
+    if (( NG_TEMP_CUR < NG_TEMP_MIN )); then NG_TEMP_MIN="${NG_TEMP_CUR}"; fi
+    if (( NG_TEMP_CUR > NG_TEMP_MAX )); then NG_TEMP_MAX="${NG_TEMP_CUR}"; fi
+
+    # Per-step min/max (set by ng_run_bg_with_temp)
+    if [[ -z "${NG_STEP_TEMP_MIN}" ]]; then NG_STEP_TEMP_MIN="${NG_TEMP_CUR}"; fi
+    if [[ -z "${NG_STEP_TEMP_MAX}" ]]; then NG_STEP_TEMP_MAX="${NG_TEMP_CUR}"; fi
+    if (( NG_TEMP_CUR < NG_STEP_TEMP_MIN )); then NG_STEP_TEMP_MIN="${NG_TEMP_CUR}"; fi
+    if (( NG_TEMP_CUR > NG_STEP_TEMP_MAX )); then NG_STEP_TEMP_MAX="${NG_TEMP_CUR}"; fi
+
+    # Ramp rate (C per minute) based on sample-to-sample delta
+    if [[ "${NG_TEMP_PREV}" =~ ^[0-9]+$ ]] && (( NG_TEMP_PREV_TS > 0 )); then
+      dt=$(( now - NG_TEMP_PREV_TS ))
+      if (( dt > 0 )); then
+        delta=$(( NG_TEMP_CUR - NG_TEMP_PREV ))
+        (( delta < 0 )) && delta=$(( -delta ))
+        ramp=$(( (delta * 60) / dt ))
+        if (( ramp > NG_TEMP_MAX_RAMP_CPM )); then NG_TEMP_MAX_RAMP_CPM="${ramp}"; fi
+      fi
+    fi
+    NG_TEMP_PREV="${NG_TEMP_CUR}"
+    NG_TEMP_PREV_TS="${now}"
+
+    # Samples above pause threshold (rough "time hot" indicator)
+    if (( NG_TEMP_CUR >= NG_TEMP_PAUSE_C )); then
+      NG_TEMP_ABOVE_PAUSE_SAMPLES=$((NG_TEMP_ABOVE_PAUSE_SAMPLES + 1))
+    fi
+  fi
+# Derived minute counters for HUD
+NG_TEMP_STEP_ABOVE_PAUSE_MIN=$(( NG_TEMP_STEP_ABOVE_PAUSE_SECONDS / 60 ))
+NG_TEMP_ABOVE_PAUSE_MIN=$(( NG_TEMP_ABOVE_PAUSE_SECONDS / 60 ))
+
+}
+
+ng_temp_guard_process() {
+  local pid="$1" step_num="$2" step_name="$3"
+  local paused="n"
+  local pause_start_ts=0
+  while kill -0 "${pid}" 2>/dev/null; do
+    ng_temp_update_vars
+    if [[ "${NG_TEMP_CUR}" =~ ^[0-9]+$ ]]; then
+      if (( NG_TEMP_CUR >= NG_TEMP_ABORT_C )); then
+        ng_log_line "TEMP-ABORT: ${NG_TEMP_CUR}C >= ${NG_TEMP_ABORT_C}C on ${step_name}. Stopping PID ${pid}."
+        NG_TEMP_ABORT_EVENTS=$((NG_TEMP_ABORT_EVENTS + 1))
+        ng_state_write "${step_num}" "${step_name}" "TEMP_ABORT_${NG_TEMP_CUR}C"
+        kill -INT "${pid}" 2>/dev/null || true
+        sleep 1
+        kill -TERM "${pid}" 2>/dev/null || true
+        NG_TEMP_PAUSED="n"
+        return 75
+      fi
+      if (( NG_TEMP_CUR >= NG_TEMP_PAUSE_C )); then
+        if [[ "${paused}" != "y" ]]; then
+          ng_log_line "TEMP-PAUSE: ${NG_TEMP_CUR}C >= ${NG_TEMP_PAUSE_C}C on ${step_name}. SIGSTOP PID ${pid}."
+          NG_TEMP_PAUSE_EVENTS=$((NG_TEMP_PAUSE_EVENTS + 1))
+          pause_start_ts="$(date +%s)"
+          kill -STOP "${pid}" 2>/dev/null || true
+          paused="y"
+          NG_TEMP_PAUSED="y"
+        fi
+      else
+        if [[ "${paused}" == "y" ]] && (( NG_TEMP_CUR <= NG_TEMP_RESUME_C )); then
+          ng_log_line "TEMP-RESUME: ${NG_TEMP_CUR}C <= ${NG_TEMP_RESUME_C}C on ${step_name}. SIGCONT PID ${pid}."
+          kill -CONT "${pid}" 2>/dev/null || true
+          paused="n"
+          NG_TEMP_PAUSED="n"
+          pause_start_ts=0
+        fi
+      fi
+    fi
+    # If we are paused, accumulate paused time
+    if [[ "${paused}" == "y" ]]; then
+      NG_TEMP_PAUSED_SECONDS=$((NG_TEMP_PAUSED_SECONDS + NG_TEMP_POLL_S))
+    fi
+
+    sleep "${NG_TEMP_POLL_S}"
+  done
+  NG_TEMP_PAUSED="n"
+  return 0
+}
+
+ng_run_bg_with_temp() {
+  local step_num="$1"; shift
+  local step_title="$1"; shift
+  local io_mode="$1"; shift   # read|write|none
+
+  local cmd=("$@")
+  ng_log_line "RUN: ${cmd[*]}"
+
+  local total_bytes
+  total_bytes=$(blockdev --getsize64 "$NG_DISK" 2>/dev/null || echo 0)
+
+  NG_TEMP_STEP_ABOVE_PAUSE_SECONDS=0
+  NG_TEMP_STEP_PAUSED_SECONDS=0
+  NG_TEMP_STEP_ABORTED=0
+  NG_TEMP_STEP_PAUSED=0
+
+  # start worker
+  ("${cmd[@]}") >>"$NG_LOG" 2>&1 &
+  local pid=$!
+
+  local last_bytes=0
+  local last_ts=$(date +%s)
+
+  while kill -0 $pid 2>/dev/null; do
+    ng_temp_update_vars
+
+    # temp guard
+    if [[ "$NG_TEMP_ENABLE" == "y" && "$NG_TEMP_CUR" != "" ]]; then
+      if (( NG_TEMP_CUR >= NG_TEMP_PAUSE_C )); then
+        NG_TEMP_STEP_ABOVE_PAUSE_SECONDS=$((NG_TEMP_STEP_ABOVE_PAUSE_SECONDS + NG_TEMP_POLL_S))
+        NG_TEMP_ABOVE_PAUSE_SECONDS=$((NG_TEMP_ABOVE_PAUSE_SECONDS + NG_TEMP_POLL_S))
+      fi
+
+      # hard abort
+      if (( NG_TEMP_CUR >= NG_TEMP_ABORT_C )); then
+        NG_TEMP_ABORT_EVENTS=$((NG_TEMP_ABORT_EVENTS + 1))
+        ng_log_line "TEMP ABORT: ${NG_TEMP_CUR}C >= abort ${NG_TEMP_ABORT_C}C"
+        kill -TERM $pid 2>/dev/null || true
+        sleep 1
+        kill -KILL $pid 2>/dev/null || true
+        NG_TEMP_STEP_ABORTED=1
+        break
+      fi
+
+      # fail-above timer
+      if (( NG_TEMP_FAIL_MIN > 0 )) && (( NG_TEMP_STEP_ABOVE_PAUSE_SECONDS >= NG_TEMP_FAIL_MIN*60 )); then
+        ng_log_line "TEMP FAIL: above pause for >= ${NG_TEMP_FAIL_MIN} min"
+        kill -TERM $pid 2>/dev/null || true
+        sleep 1
+        kill -KILL $pid 2>/dev/null || true
+        NG_TEMP_STEP_ABORTED=1
+        break
+      fi
+
+      # pause/resume
+      if (( NG_TEMP_CUR >= NG_TEMP_PAUSE_C )) && (( NG_TEMP_STEP_PAUSED == 0 )); then
+        NG_TEMP_STEP_PAUSED=1
+        NG_TEMP_PAUSE_EVENTS=$((NG_TEMP_PAUSE_EVENTS + 1))
+        ng_log_line "TEMP PAUSE: ${NG_TEMP_CUR}C >= pause ${NG_TEMP_PAUSE_C}C"
+        kill -STOP $pid 2>/dev/null || true
+      fi
+      if (( NG_TEMP_STEP_PAUSED == 1 )) && (( NG_TEMP_CUR <= NG_TEMP_RESUME_C )); then
+        NG_TEMP_STEP_PAUSED=0
+        ng_log_line "TEMP RESUME: ${NG_TEMP_CUR}C <= resume ${NG_TEMP_RESUME_C}C"
+        kill -CONT $pid 2>/dev/null || true
+      fi
+      if (( NG_TEMP_STEP_PAUSED == 1 )); then
+        NG_TEMP_STEP_PAUSED_SECONDS=$((NG_TEMP_STEP_PAUSED_SECONDS + NG_TEMP_POLL_S))
+        NG_TEMP_PAUSED_SECONDS=$((NG_TEMP_PAUSED_SECONDS + NG_TEMP_POLL_S))
+      fi
+    fi
+
+    # progress
+    prog=""
+    if [[ "$io_mode" != "none" && -r /proc/$pid/io && $total_bytes -gt 0 ]]; then
+      cur=$(awk -F': ' '/^(read_bytes|write_bytes):/ {print $2}' /proc/$pid/io 2>/dev/null | tail -n1)
+      if [[ "$io_mode" == "read" ]]; then
+        cur=$(awk -F': ' '/^read_bytes:/ {print $2}' /proc/$pid/io 2>/dev/null)
+      else
+        cur=$(awk -F': ' '/^write_bytes:/ {print $2}' /proc/$pid/io 2>/dev/null)
+      fi
+      now=$(date +%s)
+      dt=$((now - last_ts))
+      if (( dt <= 0 )); then dt=1; fi
+      dbytes=$((cur - last_bytes))
+      speed=$((dbytes / dt))
+      pct=$((cur * 100 / total_bytes))
+      prog=$(printf " | %d%% | %s/s" "$pct" "$(numfmt --to=iec --suffix=B $speed 2>/dev/null || echo ${speed}B)")
+      last_bytes=$cur
+      last_ts=$now
+    fi
+
+    # derived mins for HUD
+    NG_TEMP_STEP_ABOVE_PAUSE_MIN=$((NG_TEMP_STEP_ABOVE_PAUSE_SECONDS/60))
+    NG_TEMP_ABOVE_PAUSE_MIN=$((NG_TEMP_ABOVE_PAUSE_SECONDS/60))
+    NG_TEMP_PAUSED_MIN=$((NG_TEMP_PAUSED_SECONDS/60))
+
+    ng_draw "$step_num" "${step_title}${prog}"
+    sleep "$NG_TEMP_POLL_S"
+  done
+
+  wait $pid 2>/dev/null
+  rc=$?
+
+  if (( NG_TEMP_STEP_ABORTED == 1 )); then
+    return 75
+  fi
+  return $rc
+}
+
+ng_resume_maybe() {
+  NG_RESUME_STEP="1"
+  if [[ "${NG_RESUME_NG}" == "y" && -f "${NG_STATE_FILE}" ]]; then
+    # shellcheck disable=SC1090
+    . "${NG_STATE_FILE}" || true
+    if [[ -n "${step_num:-}" ]]; then
+      NG_RESUME_STEP="${step_num}"
+      ng_log_line "RESUME-NG: resuming from step ${NG_RESUME_STEP} (${step_name:-unknown}) due to ${reason:-unknown}"
+    fi
+  fi
+}
+ng_on_exit() {
+  local rc=$?
+  # If a job is running, try to stop it
+  if [[ -n "${NG_BG_PID:-}" ]] && kill -0 "${NG_BG_PID}" 2>/dev/null; then
+    ng_log_line "EXIT trap: stopping background job pid ${NG_BG_PID} (rc=${rc})"
+    kill "${NG_BG_PID}" 2>/dev/null || true
+  fi
+  # Record crash/exit state (but don't overwrite a clean FINISHED state)
+  if [[ $rc -ne 0 ]]; then
+    ng_state_write "${NG_STEP_NUM:-0}" "${NG_STEP_NAME:-unknown}" "EXIT_rc_${rc}"
+  fi
+  return $rc
+}
+
+
+
+ng_draw() {
+  local step="$1"
+  local msg="$2"
+
+# temp HUD line
+ng_temp_update_vars
+local temp_hud=""
+if [[ "${NG_TEMP_ENABLE}" == "y" ]]; then
+  temp_hud="Disk Temp: ${NG_TEMP_CUR}C (step min ${NG_STEP_TEMP_MIN:-?} / ${NG_STEP_TEMP_MAX:-?})  above-pause ${NG_TEMP_STEP_ABOVE_PAUSE_MIN:-0}m (total ${NG_TEMP_ABOVE_PAUSE_MIN:-0}m)  paused ${NG_TEMP_PAUSED_MIN:-0}m  pause ${NG_TEMP_PAUSE_C}C resume ${NG_TEMP_RESUME_C}C abort ${NG_TEMP_ABORT_C}C fail>${NG_TEMP_FAIL_ABOVE_MIN}m"
+  if [[ "${NG_TEMP_PAUSED}" == "y" ]]; then
+    temp_hud="${temp_hud}  [PAUSED]"
+  fi
+else
+  temp_hud="Disk Temp: (disabled)"
+fi
+  clear || true
+  echo "####################################################################################################################"
+  printf "# %-114s #\n" ""
+  printf "# %-114s #\n" "Preclear-NG Pipeline (Pi / universal) - ${NG_DISK} (${NG_SERIAL})"
+  printf "# %-114s #\n" "Step ${step}/6 - ${msg}"
+  printf "# %-114s #\n" "${temp_hud}"
+  printf "# %-114s #\n" ""
+  echo "####################################################################################################################"
+  echo "# Last log lines:"
+  echo "####################################################################################################################"
+  tail -n 12 "$NG_LOG" 2>/dev/null || true
+  echo "####################################################################################################################"
+}
+
+ng_smart_attr() {
+  # Print "ID NAME RAW" per line for easier diffing
+  smartctl -A "$NG_DISK" 2>/dev/null | awk '
+    /^[[:space:]]*[0-9]+[[:space:]]/{
+      id=$1; name=$2; raw=$10;
+      # some outputs shift; grab last field as raw
+      raw=$NF;
+      print id, name, raw
+    }'
+}
+
+ng_smart_snapshot() {
+  local out="$1"
+  smartctl -a "$NG_DISK" > "$out" 2>&1 || true
+  ng_smart_attr > "${out}.attrs" 2>/dev/null || true
+}
+
+ng_smart_delta() {
+  local before_file="$1" after_file="$2"
+  [[ -f "$before_file" && -f "$after_file" ]] || return 0
+
+  # Extract SMART attributes (raw values) from smartctl -A output snapshots
+  # Supports ATA and some SAT. If a field is missing, it is skipped.
+  local attrs=(
+    Reallocated_Sector_Ct Current_Pending_Sector Offline_Uncorrectable
+    Reallocated_Event_Count Reported_Uncorrect End-to-End_Error
+    UDMA_CRC_Error_Count Power_On_Hours Power_Cycle_Count Start_Stop_Count
+    Load_Cycle_Count Temperature_Celsius Airflow_Temperature_Cel
+    Total_LBAs_Written Total_LBAs_Read Host_Writes_32MiB Host_Reads_32MiB
+    Media_Wearout_Indicator Wear_Leveling_Count Percent_Lifetime_Remain
+  )
+
+  ng_log_line "SMART-DELTA: (after - before)"
+  for a in "${attrs[@]}"; do
+    local b n
+    b="$(awk -v A="$a" '$1==A{print $10; exit}' "$before_file" 2>/dev/null)"
+    n="$(awk -v A="$a" '$1==A{print $10; exit}' "$after_file" 2>/dev/null)"
+    [[ -z "$b" || -z "$n" ]] && continue
+    # numeric only
+    if [[ "$b" =~ ^[0-9]+$ && "$n" =~ ^[0-9]+$ ]]; then
+      local d=$(( n - b ))
+      ng_log_line "SMART-DELTA: ${a}: ${b} -> ${n} (Δ ${d})"
+    else
+      ng_log_line "SMART-DELTA: ${a}: ${b} -> ${n}"
+    fi
+  done
+}
+
+
+ng_dd_read() {
+  local label="$1"
+  ng_log_line "$label: starting full read (dd if=$NG_DISK of=/dev/null bs=4M)"
+  ng_run_bg_with_temp "${NG_STEP_NUM:-1}" "${label}" dd if="$NG_DISK" of=/dev/null bs=4M status=progress iflag=direct
+  local rc=$?
+  ng_log_line "$label: dd exit code $rc"
+  return $rc
+}
+
+ng_dd_zero() {
+  local label="$1"
+  ng_log_line "$label: starting full zero write (dd if=/dev/zero of=$NG_DISK bs=4M)"
+  ng_run_bg_with_temp "${NG_STEP_NUM:-4}" "${label}" dd if=/dev/zero of="$NG_DISK" bs=4M status=progress oflag=direct conv=fsync
+  local rc=$?
+  ng_log_line "$label: dd exit code $rc"
+  return $rc
+}
+
+ng_badblocks() {
+  local bsz="$1"; shift
+  local patterns="$1"; shift || true
+  ng_state_set 2
+  ng_step_thermal_reset 2
+
+  # badblocks -w already uses multiple patterns by default (0xaa,0x55,0xff,0x00).
+  # If you pass --badblocks-patterns, we log it, but still run the safe default pattern-set.
+  [[ -n "$patterns" ]] && ng_log_line "badblocks patterns requested: $patterns"
+
+  local cmd=(badblocks -wsv -b "$bsz" "$NG_DISK")
+  ng_log_line "RUN: ${cmd[*]}"
+  ng_run_bg_with_temp 2 "Step 2/6 - badblocks destructive test" write "${cmd[@]}"
+}
+
+ng_smart_long_test() {
+  # Start long test, then poll until done
+  ng_log_line "SMART: starting long self-test"
+  local start_out
+  start_out="$(smartctl -t long "$NG_DISK" 2>&1 || true)"
+  echo "$start_out" >>"$NG_LOG"
+
+  # Poll status
+  while true; do
+    local st
+    st="$(smartctl -c "$NG_DISK" 2>&1 | grep -E 'Self-test execution status' || true)"
+    ng_log_line "SMART: ${st:-status unavailable}"
+    ng_draw 3 "SMART long self-test running (polling)"
+    # If status indicates completed (0%) we break. This is heuristic but works on most drives.
+    if echo "$st" | grep -qE 'completed|Completed|0% of test remaining'; then
+      break
+    fi
+    sleep 60
+  done
+
+  ng_log_line "SMART: self-test log (latest entries)"
+  smartctl -l selftest "$NG_DISK" >>"$NG_LOG" 2>&1 || true
+
+  # If the latest test entry shows "Completed without error", call it pass; otherwise fail.
+  if smartctl -l selftest "$NG_DISK" 2>/dev/null | head -n 15 | grep -qiE 'Completed without error'; then
+    ng_log_line "SMART: long self-test PASSED"
+    return 0
+  fi
+  ng_log_line "SMART: long self-test may have FAILED or is inconclusive (check log)"
+  return 1
+}
+
+ng_certificate() {
+  local status="$1"  # PASS/FAIL
+  local cert="$2"
+
+  {
+    echo "####################################################################################################################"
+    echo "# Preclear-NG Certificate"
+    echo "####################################################################################################################"
+    echo "Date: $(date -Is)"
+    echo "Disk: ${NG_DISK}"
+    echo "Serial: ${NG_SERIAL}"
+    echo "Model: ${NG_MODEL}"
+    echo "Status: ${status}"
+    echo ""
+    echo "Pipeline:"
+    echo "  1) Pre-read full surface scan"
+    echo "  2) Multi-pattern destructive badblocks"
+    echo "  3) SMART long self-test"
+    echo "  4) Full zero write"
+    echo "  5) Final full read verify"
+    echo "  6) SMART delta report"
+    echo ""
+
+    echo "Thermals:"
+    echo "  Enabled: ${NG_TEMP_ENABLE}"
+    echo "  Current: ${NG_TEMP_CUR}C"
+    echo "  Min/Max: ${NG_TEMP_MIN:-n/a}C / ${NG_TEMP_MAX:-n/a}C"
+    echo "  Max ramp: ${NG_TEMP_MAX_RAMP_CPM} C/min (approx)"
+    echo "  Pause/Abort: ${NG_TEMP_PAUSE_EVENTS} / ${NG_TEMP_ABORT_EVENTS}"
+    echo "  Paused time: ${NG_TEMP_PAUSED_SECONDS}s"
+    echo "  Hot time: $(( (NG_TEMP_ABOVE_PAUSE_SAMPLES * NG_TEMP_POLL_S) / 60 )) min (approx)"
+    echo "  Thermal grade: $(ng_temp_grade)"
+    echo ""
+    echo "SMART deltas (before -> after) for key attributes (if present):"
+    awk 'NR==FNR{a[$2]=$3;next}{
+      b=a[$2];
+      if(b=="" && $3!="") b="(missing)";
+      if($3=="" && b!="") $3="(missing)";
+      if(b!=$3){ printf "  %-28s %s -> %s\n",$2,b,$3 }
+    }' "${NG_SMART_BEFORE}.attrs" "${NG_SMART_AFTER}.attrs" 2>/dev/null || true
+    echo ""
+    echo "Log: ${NG_LOG}"
+    echo "SMART before: ${NG_SMART_BEFORE}"
+    echo "SMART after:  ${NG_SMART_AFTER}"
+    echo "####################################################################################################################"
+  } > "$cert"
+  echo "THERMAL SUMMARY: ${NG_THERM_SUMMARY}" >> "$out"
+}
+
+
+# -------------------------------
+# Temperature abort safety (NG)
+# -------------------------------
+NG_TEMP_ENABLE="y"
+NG_TEMP_PAUSE_C=50
+NG_TEMP_RESUME_C=45
+NG_TEMP_ABORT_C=55
+NG_TEMP_POLL_S=15
+NG_TEMP_FAIL_MIN=30   # hard FAIL if time above pause temp exceeds this many minutes (0 disables)
+
+NG_TEMP_CUR="n/a"
+NG_TEMP_PAUSED="n"
+NG_TEMP_FAIL="n"
+NG_STATE_FILE=""
+# NG temp stats (initialized in run_pipeline_ng, but define for -u safety)
+NG_TEMP_MIN=""
+NG_TEMP_MAX=""
+NG_TEMP_MAX_RAMP_CPM=0
+NG_TEMP_PREV=""
+NG_TEMP_PREV_TS=0
+
+# Per-step thermal summaries
+declare -A NG_THERM_MIN NG_THERM_MAX NG_THERM_HOTMIN NG_THERM_PAUSEMIN
+NG_THERM_SUMMARY=""
+NG_TEMP_PAUSE_EVENTS=0
+NG_TEMP_ABORT_EVENTS=0
+NG_TEMP_PAUSED_SECONDS=0
+NG_TEMP_ABOVE_PAUSE_SAMPLES=0
+NG_TEMP_SAMPLE_COUNT=0
+NG_STEP_TEMP_MIN=""
+NG_STEP_TEMP_MAX=""
+
+NG_RESUME_NG="n"
+NG_RESUME_STEP="1"
+
+ng_park_stress() {
+  local disk="$1" loops="$2"
+  (( loops > 0 )) || return 0
+  if ! command -v hdparm >/dev/null 2>&1; then
+    ng_log_line "PARK-STRESS: hdparm not installed; skipping."
+    return 0
+  fi
+  ng_log_line "PARK-STRESS: Running ${loops} APM/standby toggles (best-effort)."
+  local i
+  for ((i=1;i<=loops;i++)); do
+    # Some drives ignore these; that's OK.
+    hdparm -B 1 -S 12 "$disk" >/dev/null 2>&1 || true
+    sleep 2
+    hdparm -B 255 -S 0 "$disk" >/dev/null 2>&1 || true
+    sleep 1
+    if (( i % 25 == 0 )); then ng_log_line "PARK-STRESS: ${i}/${loops}"; fi
+  done
+  ng_log_line "PARK-STRESS: Done."
+}
+
+ng_fio_latency() {
+  local disk="$1" seconds="$2"
+  (( seconds > 0 )) || return 0
+  if ! command -v fio >/dev/null 2>&1; then
+    ng_log_line "FIO-LATENCY: fio not installed; skipping."
+    return 0
+  fi
+  ng_log_line "FIO-LATENCY: Running randread latency sample for ${seconds}s (4k, iodepth=1, direct=1)."
+  fio --name=lat --filename="$disk" --rw=randread --direct=1 --bs=4k --iodepth=1 --numjobs=1 --time_based --runtime="$seconds" --ioengine=libaio --group_reporting >> "${NG_LOG}" 2>&1 || return 1
+  # Pull key latency lines into log for quick scan
+  grep -E "clat|lat" -A1 -n "${NG_LOG}" | tail -n 30 | while read -r l; do ng_log_line "FIO-LATENCY: ${l}"; done
+}
+
+run_pipeline_ng() {
+  NG_DISK="$1"
+
+  if [[ ! -b "$NG_DISK" ]]; then
+    echo "NG: '$NG_DISK' is not a block device."
+    exit 1
+  fi
+
+  NG_SERIAL="$(lsblk -dn -o SERIAL "$NG_DISK" 2>/dev/null | head -n1)"
+  NG_MODEL="$(lsblk -dn -o MODEL "$NG_DISK" 2>/dev/null | head -n1)"
+  [[ -z "$NG_SERIAL" ]] && NG_SERIAL="$(basename "$NG_DISK")"
+# Resume/state file (now that serial is known)
+  # Pi/Universal state + outputs (avoid Pi USB flash paths)
+  NG_USER="${SUDO_USER:-$USER}"
+  NG_USER_HOME="$(getent passwd "$NG_USER" 2>/dev/null | cut -d: -f6)"
+  [[ -z "$NG_USER_HOME" ]] && NG_USER_HOME="$HOME"
+  NG_OUT_DIR="${NG_USER_HOME}/preclear_reports"
+  NG_STATE_DIR="/var/tmp/pi-preclear"
+  mkdir -p "$NG_OUT_DIR" "$NG_STATE_DIR"
+  chown -R "$NG_USER":"$NG_USER" "$NG_OUT_DIR" 2>/dev/null || true
+  NG_STATE_FILE="${NG_STATE_DIR}/${NG_SERIAL}.ng.state"
+  ng_resume_maybe
+
+# Temperature statistics (overall and per-step)
+NG_TEMP_MIN=""
+NG_TEMP_MAX=""
+NG_TEMP_MAX_RAMP_CPM=0
+NG_TEMP_PREV=""
+NG_TEMP_PREV_TS=0
+NG_TEMP_PAUSE_EVENTS=0
+NG_TEMP_ABORT_EVENTS=0
+NG_TEMP_PAUSED_SECONDS=0
+NG_TEMP_ABOVE_PAUSE_SAMPLES=0
+NG_TEMP_SAMPLE_COUNT=0
+
+    NG_LOG="${NG_OUT_DIR}/preclear-ng_${NG_SERIAL}_$(date +%Y.%m.%d_%H.%M.%S).log"
+    NG_SMART_BEFORE="${NG_OUT_DIR}/smart_before_${NG_SERIAL}_$(date +%Y.%m.%d_%H.%M.%S).txt"
+    NG_SMART_AFTER="${NG_OUT_DIR}/smart_after_${NG_SERIAL}_$(date +%Y.%m.%d_%H.%M.%S).txt"
+    NG_CERT="${NG_OUT_DIR}/preclear-ng_certificate_${NG_SERIAL}_$(date +%Y.%m.%d_%H.%M.%S).txt"
+
+  touch "$NG_LOG" || { echo "Cannot write log to $NG_LOG"; exit 1; }
+
+  # Choose badblocks block size
+  local pbsz
+  pbsz="$(cat "/sys/block/$(basename "$NG_DISK")/queue/physical_block_size" 2>/dev/null || true)"
+  [[ -z "$pbsz" || "$pbsz" == "0" ]] && pbsz="4096"
+  local bsz="${ng_badblocks_bsz:-$pbsz}"
+
+  ng_draw 0 "Initializing"
+  ng_log_line "Starting Preclear-NG pipeline on $NG_DISK (serial=$NG_SERIAL model=$NG_MODEL)"
+  ng_log_line "Using badblocks block size: $bsz"
+
+  ng_draw 6 "Capturing SMART baseline"
+  ng_smart_snapshot "$NG_SMART_BEFORE"
+
+
+  local start_step="${NG_RESUME_STEP:-1}"
+
+  for (( NG_CYCLE=1; NG_CYCLE<=cycles; NG_CYCLE++ )); do
+    ng_log_line "=== NG Cycle ${NG_CYCLE}/${cycles} (start step: ${start_step}) ==="
+
+    # Step 1/6 - Pre-read
+    if (( start_step <= 1 )); then
+      NG_STEP_NUM=1
+      ng_state_set 1
+      ng_step_thermal_reset 1
+      ng_draw 1 "Pre-read full surface scan"
+      if ! ng_dd_read "Step1 Pre-read"; then
+        rc=$?
+        if [[ $rc -eq 75 ]]; then
+          echo "TEMP abort triggered. Resume later with --resume-ng"
+          exit 75
+        fi
+        ng_log_line "FAIL: pre-read failed"
+        ng_smart_snapshot "$NG_SMART_AFTER"
+        ng_certificate "FAIL" "$NG_CERT"
+        echo "NG pipeline FAILED (pre-read). Certificate: $NG_CERT"
+        exit 2
+      fi
+      ng_step_thermal_finalize 1 "pre-read"
+    fi
+
+    # Step 2/6 - badblocks
+    if (( start_step <= 2 )); then
+      NG_STEP_NUM=2
+      ng_state_set 2
+      ng_draw 2 "badblocks destructive test"
+      if ! ng_badblocks "$bsz" "$ng_badblocks_patterns"; then
+        rc=$?
+        if [[ $rc -eq 75 ]]; then
+          echo "TEMP abort triggered. Resume later with --resume-ng"
+          exit 75
+        fi
+        ng_log_line "FAIL: badblocks found errors"
+        ng_smart_snapshot "$NG_SMART_AFTER"
+        ng_certificate "FAIL" "$NG_CERT"
+        echo "NG pipeline FAILED (badblocks). Certificate: $NG_CERT"
+        exit 3
+      fi
+      ng_step_thermal_finalize 2 "badblocks"
+    fi
+
+    # Step 3/6 - SMART long (optional)
+    if [[ "${ng_smart_long}" == "y" ]] && (( start_step <= 3 )); then
+      NG_STEP_NUM=3
+      ng_state_set 3
+      ng_step_thermal_reset 3
+      ng_draw 3 "SMART long self-test"
+      if ! ng_smart_long_test; then
+        ng_log_line "FAIL: SMART long self-test did not pass"
+        ng_smart_snapshot "$NG_SMART_AFTER"
+        ng_certificate "FAIL" "$NG_CERT"
+        echo "NG pipeline FAILED (SMART long). Certificate: $NG_CERT"
+        exit 4
+      fi
+      ng_step_thermal_finalize 3 "SMART long"
+    fi
+
+    # Step 4/6 - Zero write
+    if (( start_step <= 4 )); then
+      NG_STEP_NUM=4
+      ng_state_set 4
+      ng_step_thermal_reset 4
+      ng_draw 4 "Full zero write"
+      if ! ng_dd_zero "Step4 Zero"; then
+        rc=$?
+        if [[ $rc -eq 75 ]]; then
+          echo "TEMP abort triggered. Resume later with --resume-ng"
+          exit 75
+        fi
+        ng_log_line "FAIL: zero write failed"
+        ng_smart_snapshot "$NG_SMART_AFTER"
+        ng_certificate "FAIL" "$NG_CERT"
+        echo "NG pipeline FAILED (zero). Certificate: $NG_CERT"
+        exit 5
+      fi
+      ng_step_thermal_finalize 4 "zero"
+    fi
+
+    # Step 5/6 - Final read verify
+    if (( start_step <= 5 )); then
+      NG_STEP_NUM=5
+      ng_state_set 5
+      ng_step_thermal_reset 5
+      ng_draw 5 "Final full read verify"
+      if ! ng_dd_read "Step5 Final Read"; then
+        rc=$?
+        if [[ $rc -eq 75 ]]; then
+          echo "TEMP abort triggered. Resume later with --resume-ng"
+          exit 75
+        fi
+        ng_log_line "FAIL: final read verify failed"
+        ng_smart_snapshot "$NG_SMART_AFTER"
+        ng_certificate "FAIL" "$NG_CERT"
+        echo "NG pipeline FAILED (final read). Certificate: $NG_CERT"
+        exit 6
+      fi
+      ng_step_thermal_finalize 5 "final read"
+    fi
+
+    # Step 6/6 - SMART after + certificate
+    if (( start_step <= 6 )); then
+      NG_STEP_NUM=6
+      ng_state_set 6
+      ng_draw 6 "Capturing SMART after + generating certificate"
+      ng_smart_snapshot "$NG_SMART_AFTER"
+      ng_smart_delta "$NG_SMART_BEFORE" "$NG_SMART_AFTER"
+      ng_certificate "PASS" "$NG_CERT"
+      ng_log_line "PASS: Preclear-NG pipeline finished successfully"
+      ng_draw 6 "DONE - PASS (certificate generated)"
+      ng_state_clear
+      echo "NG pipeline PASSED. Certificate: $NG_CERT"
+      echo "Log: $NG_LOG"
+    fi
+
+    start_step=1
+  done
+}
+
+
+
+# ------------------------------
+# End Preclear-NG Pipeline block
+# ------------------------------
+
 ##                  PARSE OPTIONS                   ##
 ##                                                  ##
 ######################################################
@@ -1943,7 +2683,7 @@ append canvas 'width'  '123'
 append canvas 'height' '20'
 append canvas 'brick'  '#'
 smart_type=auto
-pipeline_ng=n
+pipeline_ng=y
 ng_no_signature=y
 ng_badblocks_patterns="0xaa,0x55,0xff,0x00"
 ng_badblocks_bsz=""
@@ -1951,9 +2691,9 @@ ng_smart_long=y
 notify_channel=0
 notify_freq=0
 opts_long="frequency:,notify:,skip-preread,skip-postread,read-size:,write-size:,read-blocks:,test,no-stress,list,"
-opts_long+="cycles:,no-prompt,version,format-html,erase,erase-clear,load-file:,unassigned",pipeline-ng,no-signature,badblocks-blocksize:,badblocks-patterns:,smart-long
+opts_long+="cycles:,no-prompt,version,format-html,erase,erase-clear,load-file:,unassigned,pipeline-ng,legacy,no-signature,badblocks-blocksize:,badblocks-patterns:,smart-long,temp-disable,temp-pause:,temp-resume:,temp-abort:,temp-interval:,temp-fail-min:,resume-ng"
 
-OPTS=$(getopt -o f:n:sSr:w:b:tdlc:ujvomera:U \
+OPTS=$(getopt -o f:n:sSr:w:b:tdlc:jvmeEa:U \
       --long $opts_long -n "$(basename $0)" -- "$@")
 
 if [ "$?" -ne "0" ]; then
@@ -1979,16 +2719,17 @@ while true ; do
     -v|--version)        echo "$0 version: $version";         exit 0;;
     -m|--format-html)    format_html=y;                       shift 1;;
     -e|--erase)          erase_disk=y;                        shift 1;;
-    -r|--erase-clear)    erase_preclear=y;                    shift 1;;
+    -E|--erase-clear)    erase_preclear=y;                    shift 1;;
     -a|--load-file)      load_file="$2";                      shift 2;;
     -U|--unassigned)     list_unassigned_disks;               exit 0;;
 
     --pipeline-ng)       pipeline_ng=y;                      shift 1;;
+    --legacy)            pipeline_ng=n;                      shift 1;;
     --no-signature)      ng_no_signature=y;                  shift 1;;
     --badblocks-blocksize) ng_badblocks_bsz="$2";            shift 2;;
     --badblocks-patterns)  ng_badblocks_patterns="$2";       shift 2;;
     --smart-long)        ng_smart_long=y;                    shift 1;;
---resume-ng)        NG_RESUME_NG="y";                   shift 1;;
+    --resume-ng)        NG_RESUME_NG="y";                   shift 1;;
 --temp-disable)     NG_TEMP_ENABLE="n";                 shift 1;;
 --temp-pause)       NG_TEMP_PAUSE_C="$2";               shift 2;;
 --temp-resume)      NG_TEMP_RESUME_C="$2";              shift 2;;
@@ -2632,719 +3373,43 @@ rm -f ${all_files[resume_file]}
 
 tmux_window="preclear_disk_${disk_properties[serial]}"
 if [ "$(tmux ls 2>/dev/null | grep -c "${tmux_window}")" -gt 0 ]; then
-  tmux capture-pane -t "${tmux_window}" && tmux show-buffer >$report 2>&1
+  tmux capture-pane -t "${tmux_window}" && tmux show-buffer >"$report" 2>&1
 else
-  display_status '' '' >$report
+  display_status '' '' >"$report"
   if [ "$disable_smart" != "y" ]; then
-    echo -e "\n--> ATTENTION: Please take a look into the SMART report above for drive health issues.\n" >>$report
+    echo -e "\n--> ATTENTION: Please take a look into the SMART report above for drive health issues.\n" >>"$report"
   fi
-  echo -e "--> RESULT: ${op_title} Finished Successfully!\n\n" >>$report
+  echo -e "--> RESULT: ${op_title} Finished Successfully!\n\n" >>"$report"
   report_tmux="preclear_disk_report_${disk_properties[name]}"
 
   tmux new-session -d -x 140 -y 200 -s "${report_tmux}"
   tmux send -t "${report_tmux}" "cat '$report'" ENTER
   sleep 1
 
-  tmux capture-pane -t "${report_tmux}" && tmux show-buffer >$report 2>&1
+  tmux capture-pane -t "${report_tmux}" && tmux show-buffer >"$report" 2>&1
   tmux kill-session -t "${report_tmux}" >/dev/null 2>&1
 fi
 
 
 # ------------------------------
-# Preclear-NG Pipeline (Pi / universal)
-# ------------------------------
-ng_log_line() {
-  local msg="$1"
-  echo "$(date '+%b %d %H:%M:%S') preclear-ng: $msg" | tee -a "$NG_LOG" >/dev/null
-}
 
-
-ng_state_write() {
-  local step_num="$1" step_name="$2" reason="$3"
-  [[ -z "${NG_STATE_FILE}" ]] && return 0
-  mkdir -p "$(dirname "${NG_STATE_FILE}")" 2>/dev/null || true
-  cat > "${NG_STATE_FILE}" <<EOF
-step_num=${step_num}
-step_name=${step_name}
-reason=${reason}
-ts=$(date -Is)
-EOF
-}
-
-ng_state_clear() {
-  [[ -n "${NG_STATE_FILE}" ]] && rm -f "${NG_STATE_FILE}" 2>/dev/null || true
-}
-
-ng_temp_read_c() {
-  [[ "${NG_TEMP_ENABLE}" != "y" ]] && { echo ""; return 0; }
-  local t
-  t="$(get_disk_temp "${NG_DISK}" "default" 2>/dev/null || true)"
-  t="${t%% *}"
-  if [[ "${t}" =~ ^[0-9]+$ ]]; then echo "${t}"; else echo ""; fi
-}
-
-ng_temp_grade() {
-  # Simple thermal risk grading for the run (not a definitive drive health verdict).
-  # Uses overall peak temp + any thermal pause/abort events.
-  local max="${NG_TEMP_MAX:-}"
-  if [[ ! "${max}" =~ ^[0-9]+$ ]]; then
-    echo "n/a"
-    return 0
-  fi
-
-  if (( NG_TEMP_ABORT_EVENTS > 0 )) || (( max >= NG_TEMP_ABORT_C )); then
-    echo "OVERHEAT (abort threshold reached)"
-  elif (( NG_TEMP_PAUSE_EVENTS > 0 )) || (( max >= NG_TEMP_PAUSE_C )); then
-    echo "HOT (hit pause threshold)"
-  elif (( max >= 45 )); then
-    echo "WARM (45C+ peak)"
-  elif (( max >= 40 )); then
-    echo "OK (40C+ peak)"
-  else
-    echo "COOL"
-  fi
-}
-
-ng_temp_update_vars() {
-  local t now dt delta ramp
-  t="$(ng_temp_read_c)"
-  if [[ -n "${t}" ]]; then
-    NG_TEMP_CUR="${t}"
-  else
-    NG_TEMP_CUR="n/a"
-    return 0
-  fi
-
-  # Stats only when numeric
-  if [[ "${NG_TEMP_CUR}" =~ ^[0-9]+$ ]]; then
-    now="$(date +%s)"
-    NG_TEMP_SAMPLE_COUNT=$((NG_TEMP_SAMPLE_COUNT + 1))
-
-    # Overall min/max
-    if [[ -z "${NG_TEMP_MIN}" ]]; then NG_TEMP_MIN="${NG_TEMP_CUR}"; fi
-    if [[ -z "${NG_TEMP_MAX}" ]]; then NG_TEMP_MAX="${NG_TEMP_CUR}"; fi
-    if (( NG_TEMP_CUR < NG_TEMP_MIN )); then NG_TEMP_MIN="${NG_TEMP_CUR}"; fi
-    if (( NG_TEMP_CUR > NG_TEMP_MAX )); then NG_TEMP_MAX="${NG_TEMP_CUR}"; fi
-
-    # Per-step min/max (set by ng_run_bg_with_temp)
-    if [[ -z "${NG_STEP_TEMP_MIN}" ]]; then NG_STEP_TEMP_MIN="${NG_TEMP_CUR}"; fi
-    if [[ -z "${NG_STEP_TEMP_MAX}" ]]; then NG_STEP_TEMP_MAX="${NG_TEMP_CUR}"; fi
-    if (( NG_TEMP_CUR < NG_STEP_TEMP_MIN )); then NG_STEP_TEMP_MIN="${NG_TEMP_CUR}"; fi
-    if (( NG_TEMP_CUR > NG_STEP_TEMP_MAX )); then NG_STEP_TEMP_MAX="${NG_TEMP_CUR}"; fi
-
-    # Ramp rate (C per minute) based on sample-to-sample delta
-    if [[ "${NG_TEMP_PREV}" =~ ^[0-9]+$ ]] && (( NG_TEMP_PREV_TS > 0 )); then
-      dt=$(( now - NG_TEMP_PREV_TS ))
-      if (( dt > 0 )); then
-        delta=$(( NG_TEMP_CUR - NG_TEMP_PREV ))
-        (( delta < 0 )) && delta=$(( -delta ))
-        ramp=$(( (delta * 60) / dt ))
-        if (( ramp > NG_TEMP_MAX_RAMP_CPM )); then NG_TEMP_MAX_RAMP_CPM="${ramp}"; fi
-      fi
-    fi
-    NG_TEMP_PREV="${NG_TEMP_CUR}"
-    NG_TEMP_PREV_TS="${now}"
-
-    # Samples above pause threshold (rough "time hot" indicator)
-    if (( NG_TEMP_CUR >= NG_TEMP_PAUSE_C )); then
-      NG_TEMP_ABOVE_PAUSE_SAMPLES=$((NG_TEMP_ABOVE_PAUSE_SAMPLES + 1))
-    fi
-  fi
-# Derived minute counters for HUD
-NG_TEMP_STEP_ABOVE_PAUSE_MIN=$(( NG_TEMP_STEP_ABOVE_PAUSE_SECONDS / 60 ))
-NG_TEMP_ABOVE_MIN=$(( NG_TEMP_ABOVE_PAUSE_SECONDS / 60 ))
-
-}
-
-ng_temp_guard_process() {
-  local pid="$1" step_num="$2" step_name="$3"
-  local paused="n"
-  local pause_start_ts=0
-  while kill -0 "${pid}" 2>/dev/null; do
-    ng_temp_update_vars
-    if [[ "${NG_TEMP_CUR}" =~ ^[0-9]+$ ]]; then
-      if (( NG_TEMP_CUR >= NG_TEMP_ABORT_C )); then
-        ng_log_line "TEMP-ABORT: ${NG_TEMP_CUR}C >= ${NG_TEMP_ABORT_C}C on ${step_name}. Stopping PID ${pid}."
-        NG_TEMP_ABORT_EVENTS=$((NG_TEMP_ABORT_EVENTS + 1))
-        ng_state_write "${step_num}" "${step_name}" "TEMP_ABORT_${NG_TEMP_CUR}C"
-        kill -INT "${pid}" 2>/dev/null || true
-        sleep 1
-        kill -TERM "${pid}" 2>/dev/null || true
-        NG_TEMP_PAUSED="n"
-        return 75
-      fi
-      if (( NG_TEMP_CUR >= NG_TEMP_PAUSE_C )); then
-        if [[ "${paused}" != "y" ]]; then
-          ng_log_line "TEMP-PAUSE: ${NG_TEMP_CUR}C >= ${NG_TEMP_PAUSE_C}C on ${step_name}. SIGSTOP PID ${pid}."
-          NG_TEMP_PAUSE_EVENTS=$((NG_TEMP_PAUSE_EVENTS + 1))
-          pause_start_ts="$(date +%s)"
-          kill -STOP "${pid}" 2>/dev/null || true
-          paused="y"
-          NG_TEMP_PAUSED="y"
-        fi
-      else
-        if [[ "${paused}" == "y" ]] && (( NG_TEMP_CUR <= NG_TEMP_RESUME_C )); then
-          ng_log_line "TEMP-RESUME: ${NG_TEMP_CUR}C <= ${NG_TEMP_RESUME_C}C on ${step_name}. SIGCONT PID ${pid}."
-          kill -CONT "${pid}" 2>/dev/null || true
-          paused="n"
-          NG_TEMP_PAUSED="n"
-          pause_start_ts=0
-        fi
-      fi
-    fi
-    # If we are paused, accumulate paused time
-    if [[ "${paused}" == "y" ]]; then
-      NG_TEMP_PAUSED_SECONDS=$((NG_TEMP_PAUSED_SECONDS + NG_TEMP_POLL_S))
-    fi
-
-    sleep "${NG_TEMP_POLL_S}"
-  done
-  NG_TEMP_PAUSED="n"
-  return 0
-}
-
-ng_run_bg_with_temp() {
-  local step_num="$1" step_name="$2"; shift 2
-
-  # Reset per-step temperature min/max + hot-time counters
-  NG_STEP_TEMP_MIN=""
-  NG_STEP_TEMP_MAX=""
-  NG_TEMP_STEP_ABOVE_PAUSE_SECONDS=0
-  ng_temp_update_vars
-
-  "$@" >> "${NG_LOG}" 2>&1 &
-  local pid=$!
-  ng_log_line "CMD(${step_name}): $* (pid ${pid})"
-
-  ng_temp_guard_process "${pid}" "${step_num}" "${step_name}" || return $?
-  wait "${pid}"
-  local rc=$?
-
-  # Store per-step thermal summary (even on failure)
-  local hotmin=$(( NG_TEMP_STEP_ABOVE_PAUSE_SECONDS / 60 ))
-  NG_THERM_MIN["${step_num}"]="${NG_STEP_TEMP_MIN:-n/a}"
-  NG_THERM_MAX["${step_num}"]="${NG_STEP_TEMP_MAX:-n/a}"
-  NG_THERM_HOTMIN["${step_num}"]="${hotmin}"
-  if [[ -n "${NG_THERM_SUMMARY}" ]]; then NG_THERM_SUMMARY+=" | "; fi
-  NG_THERM_SUMMARY+="S${step_num}:${NG_THERM_MIN[${step_num}]}/${NG_THERM_MAX[${step_num}]}C hot${hotmin}m"
-
-  return $rc
-}
-
-ng_resume_maybe() {
-  NG_RESUME_STEP="1"
-  if [[ "${NG_RESUME_NG}" == "y" && -f "${NG_STATE_FILE}" ]]; then
-    # shellcheck disable=SC1090
-    . "${NG_STATE_FILE}" || true
-    if [[ -n "${step_num:-}" ]]; then
-      NG_RESUME_STEP="${step_num}"
-      ng_log_line "RESUME-NG: resuming from step ${NG_RESUME_STEP} (${step_name:-unknown}) due to ${reason:-unknown}"
-    fi
-  fi
-}
-ng_on_exit() {
-  local rc=$?
-  # If a job is running, try to stop it
-  if [[ -n "${NG_BG_PID:-}" ]] && kill -0 "${NG_BG_PID}" 2>/dev/null; then
-    ng_log_line "EXIT trap: stopping background job pid ${NG_BG_PID} (rc=${rc})"
-    kill "${NG_BG_PID}" 2>/dev/null || true
-  fi
-  # Record crash/exit state (but don't overwrite a clean FINISHED state)
-  if [[ $rc -ne 0 ]]; then
-    ng_state_write "${NG_STEP_NUM:-0}" "${NG_STEP_NAME:-unknown}" "EXIT_rc_${rc}"
-  fi
-  return $rc
-}
-
-
-
-ng_draw() {
-  local step="$1"
-  local msg="$2"
-
-# temp HUD line
-ng_temp_update_vars
-local temp_hud=""
-if [[ "${NG_TEMP_ENABLE}" == "y" ]]; then
-  temp_hud="Disk Temp: ${NG_TEMP_CUR}C (min ${NG_TEMP_MIN:-?}/${NG_TEMP_MAX:-?})  step ${NG_TEMP_STEP_MIN:-?}/${NG_TEMP_STEP_MAX:-?}  above-pause ${NG_TEMP_STEP_ABOVE_MIN:-0}m (total ${NG_TEMP_ABOVE_MIN:-0}m)  pause ${NG_TEMP_PAUSE_C}C abort ${NG_TEMP_ABORT_C}C fail>${NG_TEMP_FAIL_ABOVE_MIN}m"
-  if [[ "${NG_TEMP_PAUSED}" == "y" ]]; then
-    temp_hud="${temp_hud}  [PAUSED]"
-  fi
-else
-  temp_hud="Disk Temp: (disabled)"
+# --- Legacy report save + exit (Pi-friendly) ---
+# Remove empty lines
+if [[ -n "${report:-}" && -f "$report" ]]; then
+  sed -i '/^$/{:a;N;s/\n$//;ta}' "$report" || true
 fi
-  clear || true
-  echo "####################################################################################################################"
-  printf "# %-114s #\n" ""
-  printf "# %-114s #\n" "Preclear-NG Pipeline (Pi / universal) - ${NG_DISK} (${NG_SERIAL})"
-  printf "# %-114s #\n" "Step ${step}/6 - ${msg}"
-  printf "# %-114s #\n" "${temp_hud}"
-  printf "# %-114s #\n" ""
-  echo "####################################################################################################################"
-  echo "# Last log lines:"
-  echo "####################################################################################################################"
-  tail -n 12 "$NG_LOG" 2>/dev/null || true
-  echo "####################################################################################################################"
-}
 
-ng_smart_attr() {
-  # Print "ID NAME RAW" per line for easier diffing
-  smartctl -A "$NG_DISK" 2>/dev/null | awk '
-    /^[[:space:]]*[0-9]+[[:space:]]/{
-      id=$1; name=$2; raw=$10;
-      # some outputs shift; grab last field as raw
-      raw=$NF;
-      print id, name, raw
-    }'
-}
-
-ng_smart_snapshot() {
-  local out="$1"
-  smartctl -a "$NG_DISK" > "$out" 2>&1 || true
-  ng_smart_attr > "${out}.attrs" 2>/dev/null || true
-}
-
-ng_smart_delta() {
-  local before_file="$1" after_file="$2"
-  [[ -f "$before_file" && -f "$after_file" ]] || return 0
-
-  # Extract SMART attributes (raw values) from smartctl -A output snapshots
-  # Supports ATA and some SAT. If a field is missing, it is skipped.
-  local attrs=(
-    Reallocated_Sector_Ct Current_Pending_Sector Offline_Uncorrectable
-    Reallocated_Event_Count Reported_Uncorrect End-to-End_Error
-    UDMA_CRC_Error_Count Power_On_Hours Power_Cycle_Count Start_Stop_Count
-    Load_Cycle_Count Temperature_Celsius Airflow_Temperature_Cel
-    Total_LBAs_Written Total_LBAs_Read Host_Writes_32MiB Host_Reads_32MiB
-    Media_Wearout_Indicator Wear_Leveling_Count Percent_Lifetime_Remain
-  )
-
-  ng_log_line "SMART-DELTA: (after - before)"
-  for a in "${attrs[@]}"; do
-    local b n
-    b="$(awk -v A="$a" '$1==A{print $10; exit}' "$before_file" 2>/dev/null)"
-    n="$(awk -v A="$a" '$1==A{print $10; exit}' "$after_file" 2>/dev/null)"
-    [[ -z "$b" || -z "$n" ]] && continue
-    # numeric only
-    if [[ "$b" =~ ^[0-9]+$ && "$n" =~ ^[0-9]+$ ]]; then
-      local d=$(( n - b ))
-      ng_log_line "SMART-DELTA: ${a}: ${b} -> ${n} (Δ ${d})"
-    else
-      ng_log_line "SMART-DELTA: ${a}: ${b} -> ${n}"
-    fi
-  done
-}
-
-
-ng_dd_read() {
-  local label="$1"
-  ng_log_line "$label: starting full read (dd if=$NG_DISK of=/dev/null bs=4M)"
-  ng_run_bg_with_temp "${NG_STEP_NUM:-1}" "${label}" dd if="$NG_DISK" of=/dev/null bs=4M status=progress iflag=direct
-  local rc=$?
-  ng_log_line "$label: dd exit code $rc"
-  return $rc
-}
-
-ng_dd_zero() {
-  local label="$1"
-  ng_log_line "$label: starting full zero write (dd if=/dev/zero of=$NG_DISK bs=4M)"
-  ng_run_bg_with_temp "${NG_STEP_NUM:-4}" "${label}" dd if=/dev/zero of="$NG_DISK" bs=4M status=progress oflag=direct conv=fsync
-  local rc=$?
-  ng_log_line "$label: dd exit code $rc"
-  return $rc
-}
-
-ng_badblocks() {
-  local bsz="$1"
-  local pats_csv="$2"
-
-  # Convert "0xaa,0x55" -> patterns list for logging only; badblocks uses fixed 4 patterns by default.
-  # We'll run one badblocks pass (which already cycles patterns 0xaa,0x55,0xff,0x00).
-  ng_log_line "badblocks: starting destructive multi-pattern test (badblocks -wsv -b $bsz $NG_DISK)"
-  ng_run_bg_with_temp "${NG_STEP_NUM:-2}" "badblocks" badblocks -wsv -b "$bsz" ${patterns} "$NG_DISK"
-  local rc=$?
-  ng_log_line "badblocks: exit code $rc"
-  return $rc
-}
-
-ng_smart_long_test() {
-  # Start long test, then poll until done
-  ng_log_line "SMART: starting long self-test"
-  local start_out
-  start_out="$(smartctl -t long "$NG_DISK" 2>&1 || true)"
-  echo "$start_out" >>"$NG_LOG"
-
-  # Poll status
-  while true; do
-    local st
-    st="$(smartctl -c "$NG_DISK" 2>&1 | grep -E 'Self-test execution status' || true)"
-    ng_log_line "SMART: ${st:-status unavailable}"
-    ng_draw 3 "SMART long self-test running (polling)"
-    # If status indicates completed (0%) we break. This is heuristic but works on most drives.
-    if echo "$st" | grep -qE 'completed|Completed|0% of test remaining'; then
-      break
-    fi
-    sleep 60
-  done
-
-  ng_log_line "SMART: self-test log (latest entries)"
-  smartctl -l selftest "$NG_DISK" >>"$NG_LOG" 2>&1 || true
-
-  # If the latest test entry shows "Completed without error", call it pass; otherwise fail.
-  if smartctl -l selftest "$NG_DISK" 2>/dev/null | head -n 15 | grep -qiE 'Completed without error'; then
-    ng_log_line "SMART: long self-test PASSED"
-    return 0
-  fi
-  ng_log_line "SMART: long self-test may have FAILED or is inconclusive (check log)"
-  return 1
-}
-
-ng_certificate() {
-  local status="$1"  # PASS/FAIL
-  local cert="$2"
-
-  {
-    echo "####################################################################################################################"
-    echo "# Preclear-NG Certificate"
-    echo "####################################################################################################################"
-    echo "Date: $(date -Is)"
-    echo "Disk: ${NG_DISK}"
-    echo "Serial: ${NG_SERIAL}"
-    echo "Model: ${NG_MODEL}"
-    echo "Status: ${status}"
-    echo ""
-    echo "Pipeline:"
-    echo "  1) Pre-read full surface scan"
-    echo "  2) Multi-pattern destructive badblocks"
-    echo "  3) SMART long self-test"
-    echo "  4) Full zero write"
-    echo "  5) Final full read verify"
-    echo "  6) SMART delta report"
-    echo ""
-
-    echo "Thermals:"
-    echo "  Enabled: ${NG_TEMP_ENABLE}"
-    echo "  Current: ${NG_TEMP_CUR}C"
-    echo "  Min/Max: ${NG_TEMP_MIN:-n/a}C / ${NG_TEMP_MAX:-n/a}C"
-    echo "  Max ramp: ${NG_TEMP_MAX_RAMP_CPM} C/min (approx)"
-    echo "  Pause/Abort: ${NG_TEMP_PAUSE_EVENTS} / ${NG_TEMP_ABORT_EVENTS}"
-    echo "  Paused time: ${NG_TEMP_PAUSED_SECONDS}s"
-    echo "  Hot time: $(( (NG_TEMP_ABOVE_PAUSE_SAMPLES * NG_TEMP_POLL_S) / 60 )) min (approx)"
-    echo "  Thermal grade: $(ng_temp_grade)"
-    echo ""
-    echo "SMART deltas (before -> after) for key attributes (if present):"
-    awk 'NR==FNR{a[$2]=$3;next}{
-      b=a[$2];
-      if(b=="" && $3!="") b="(missing)";
-      if($3=="" && b!="") $3="(missing)";
-      if(b!=$3){ printf "  %-28s %s -> %s\n",$2,b,$3 }
-    }' "${NG_SMART_BEFORE}.attrs" "${NG_SMART_AFTER}.attrs" 2>/dev/null || true
-    echo ""
-    echo "Log: ${NG_LOG}"
-    echo "SMART before: ${NG_SMART_BEFORE}"
-    echo "SMART after:  ${NG_SMART_AFTER}"
-    echo "####################################################################################################################"
-  } > "$cert"
-  echo "THERMAL SUMMARY: ${NG_THERM_SUMMARY}" >> "$out"
-}
-
-
-# -------------------------------
-# Temperature abort safety (NG)
-# -------------------------------
-NG_TEMP_ENABLE="y"
-NG_TEMP_PAUSE_C=50
-NG_TEMP_RESUME_C=47
-NG_TEMP_ABORT_C=55
-NG_TEMP_POLL_S=15
-NG_TEMP_FAIL_MIN=30   # hard FAIL if time above pause temp exceeds this many minutes (0 disables)
-
-NG_TEMP_CUR="n/a"
-NG_TEMP_PAUSED="n"
-NG_TEMP_FAIL="n"
-NG_STATE_FILE=""
-# NG temp stats (initialized in run_pipeline_ng, but define for -u safety)
-NG_TEMP_MIN=""
-NG_TEMP_MAX=""
-NG_TEMP_MAX_RAMP_CPM=0
-NG_TEMP_PREV=""
-NG_TEMP_PREV_TS=0
-
-# Per-step thermal summaries
-declare -A NG_THERM_MIN NG_THERM_MAX NG_THERM_HOTMIN NG_THERM_PAUSEMIN
-NG_THERM_SUMMARY=""
-NG_TEMP_PAUSE_EVENTS=0
-NG_TEMP_ABORT_EVENTS=0
-NG_TEMP_PAUSED_SECONDS=0
-NG_TEMP_ABOVE_PAUSE_SAMPLES=0
-NG_TEMP_SAMPLE_COUNT=0
-NG_STEP_TEMP_MIN=""
-NG_STEP_TEMP_MAX=""
-
-NG_RESUME_NG="n"
-NG_RESUME_STEP="1"
-
-ng_park_stress() {
-  local disk="$1" loops="$2"
-  (( loops > 0 )) || return 0
-  if ! command -v hdparm >/dev/null 2>&1; then
-    ng_log_line "PARK-STRESS: hdparm not installed; skipping."
-    return 0
-  fi
-  ng_log_line "PARK-STRESS: Running ${loops} APM/standby toggles (best-effort)."
-  local i
-  for ((i=1;i<=loops;i++)); do
-    # Some drives ignore these; that's OK.
-    hdparm -B 1 -S 12 "$disk" >/dev/null 2>&1 || true
-    sleep 2
-    hdparm -B 255 -S 0 "$disk" >/dev/null 2>&1 || true
-    sleep 1
-    if (( i % 25 == 0 )); then ng_log_line "PARK-STRESS: ${i}/${loops}"; fi
-  done
-  ng_log_line "PARK-STRESS: Done."
-}
-
-ng_fio_latency() {
-  local disk="$1" seconds="$2"
-  (( seconds > 0 )) || return 0
-  if ! command -v fio >/dev/null 2>&1; then
-    ng_log_line "FIO-LATENCY: fio not installed; skipping."
-    return 0
-  fi
-  ng_log_line "FIO-LATENCY: Running randread latency sample for ${seconds}s (4k, iodepth=1, direct=1)."
-  fio --name=lat --filename="$disk" --rw=randread --direct=1 --bs=4k --iodepth=1 --numjobs=1 --time_based --runtime="$seconds" --ioengine=libaio --group_reporting >> "${NG_LOG}" 2>&1 || return 1
-  # Pull key latency lines into log for quick scan
-  grep -E "clat|lat" -A1 -n "${NG_LOG}" | tail -n 30 | while read -r l; do ng_log_line "FIO-LATENCY: ${l}"; done
-}
-
-run_pipeline_ng() {
-  NG_DISK="$1"
-
-  if [[ ! -b "$NG_DISK" ]]; then
-    echo "NG: '$NG_DISK' is not a block device."
-    exit 1
-  fi
-
-  NG_SERIAL="$(lsblk -dn -o SERIAL "$NG_DISK" 2>/dev/null | head -n1)"
-  NG_MODEL="$(lsblk -dn -o MODEL "$NG_DISK" 2>/dev/null | head -n1)"
-  [[ -z "$NG_SERIAL" ]] && NG_SERIAL="$(basename "$NG_DISK")"
-# Resume/state file (now that serial is known)
-  # Pi/Universal state + outputs (avoid Pi USB flash paths)
-  NG_USER="${SUDO_USER:-$USER}"
-  NG_USER_HOME="$(getent passwd "$NG_USER" 2>/dev/null | cut -d: -f6)"
-  [[ -z "$NG_USER_HOME" ]] && NG_USER_HOME="$HOME"
-  NG_OUT_DIR="${NG_USER_HOME}/preclear_reports"
-  NG_STATE_DIR="/var/tmp/pi-preclear"
-  mkdir -p "$NG_OUT_DIR" "$NG_STATE_DIR"
-  chown -R "$NG_USER":"$NG_USER" "$NG_OUT_DIR" 2>/dev/null || true
-  NG_STATE_FILE="${NG_STATE_DIR}/${NG_SERIAL}.ng.state"
-  ng_resume_maybe
-
-# Temperature statistics (overall and per-step)
-NG_TEMP_MIN=""
-NG_TEMP_MAX=""
-NG_TEMP_MAX_RAMP_CPM=0
-NG_TEMP_PREV=""
-NG_TEMP_PREV_TS=0
-NG_TEMP_PAUSE_EVENTS=0
-NG_TEMP_ABORT_EVENTS=0
-NG_TEMP_PAUSED_SECONDS=0
-NG_TEMP_ABOVE_PAUSE_SAMPLES=0
-NG_TEMP_SAMPLE_COUNT=0
-
-    NG_LOG="${NG_OUT_DIR}/preclear-ng_${NG_SERIAL}_$(date +%Y.%m.%d_%H.%M.%S).log"
-    NG_SMART_BEFORE="${NG_OUT_DIR}/smart_before_${NG_SERIAL}_$(date +%Y.%m.%d_%H.%M.%S).txt"
-    NG_SMART_AFTER="${NG_OUT_DIR}/smart_after_${NG_SERIAL}_$(date +%Y.%m.%d_%H.%M.%S).txt"
-    NG_CERT="${NG_OUT_DIR}/preclear-ng_certificate_${NG_SERIAL}_$(date +%Y.%m.%d_%H.%M.%S).txt"
-
-  touch "$NG_LOG" || { echo "Cannot write log to $NG_LOG"; exit 1; }
-
-  # Choose badblocks block size
-  local pbsz
-  pbsz="$(cat "/sys/block/$(basename "$NG_DISK")/queue/physical_block_size" 2>/dev/null || true)"
-  [[ -z "$pbsz" || "$pbsz" == "0" ]] && pbsz="4096"
-  local bsz="${ng_badblocks_bsz:-$pbsz}"
-
-  ng_draw 0 "Initializing"
-  ng_log_line "Starting Preclear-NG pipeline on $NG_DISK (serial=$NG_SERIAL model=$NG_MODEL)"
-  ng_log_line "Using badblocks block size: $bsz"
-
-  ng_draw 6 "Capturing SMART baseline"
-  ng_smart_snapshot "$NG_SMART_BEFORE"
-
-  
-local start_step="${NG_RESUME_STEP:-1}"
-
-for (( NG_CYCLE=1; NG_CYCLE<=cycles; NG_CYCLE++ )); do
-  ng_log_line "=== NG Cycle ${NG_CYCLE}/${cycles} (start step: ${start_step}) ==="
-
-  if (( start_step <= 1 )); then
-    NG_STEP_NUM=1
-    ng_draw 1 "Pre-read full surface scan"
-    if ! ng_dd_read "Step1 Pre-read"; then
-      local rc=$?
-      if [[ $rc -eq 75 ]]; then echo "TEMP abort triggered. Resume later with --resume-ng"; exit 75; fi
-
-  trap ng_on_exit EXIT
-      ng_log_line "FAIL: pre-read failed"
-      ng_smart_snapshot "$NG_SMART_AFTER"
-      ng_certificate "FAIL" "$NG_CERT"
-      echo "NG pipeline FAILED (pre-read). Certificate: $NG_CERT"
-      exit 2
-    fi
-  fi
-
-  if (( start_step <= 2 )); then
-    NG_STEP_NUM=2
-    ng_draw 2 "badblocks multi-pattern destructive test"
-    if ! ng_badblocks "$bsz" "$ng_badblocks_patterns"; then
-      local rc=$?
-      if [[ $rc -eq 75 ]]; then echo "TEMP abort triggered. Resume later with --resume-ng"; exit 75; fi
-      ng_log_line "FAIL: badblocks found errors"
-      ng_smart_snapshot "$NG_SMART_AFTER"
-      ng_certificate "FAIL" "$NG_CERT"
-      echo "NG pipeline FAILED (badblocks). Certificate: $NG_CERT"
-      exit 3
-    ng_step_thermal_finalize 2 "badblocks"
-  fi
-  fi
-
-  if [[ "${ng_smart_long}" == "y" ]]; then
-    if (( start_step <= 3 )); then
-      NG_STEP_NUM=3
-      ng_draw 3 "SMART long self-test"
-      if ! ng_smart_long_test; then
-        ng_log_line "FAIL: SMART long self-test did not pass"
-        ng_smart_snapshot "$NG_SMART_AFTER"
-        ng_certificate "FAIL" "$NG_CERT"
-        echo "NG pipeline FAILED (SMART long). Certificate: $NG_CERT"
-        exit 4
-    ng_step_thermal_finalize 3 "SMART long"
-  fi
-    fi
-  fi
-
-  if (( start_step <= 4 )); then
-    NG_STEP_NUM=4
-    
-    # Optional forensic: head-park stress + latency probe (best-effort)
-    ng_draw 0 "Optional forensic checks"
-    ng_park_stress "$NG_DISK" "$NG_PARK_STRESS"
-    ng_fio_latency "$NG_DISK" "$NG_FIO_LATENCY_S"
-
-ng_draw 4 "Full zero write"
-    if ! ng_dd_zero "Step4 Zero"; then
-      local rc=$?
-      if [[ $rc -eq 75 ]]; then echo "TEMP abort triggered. Resume later with --resume-ng"; exit 75; fi
-      ng_log_line "FAIL: zero write failed"
-      ng_smart_snapshot "$NG_SMART_AFTER"
-      ng_certificate "FAIL" "$NG_CERT"
-      echo "NG pipeline FAILED (zero). Certificate: $NG_CERT"
-      exit 5
-    fi
-  fi
-
-  if (( start_step <= 5 )); then
-    NG_STEP_NUM=5
-    ng_draw 5 "Final full read verify"
-    if ! ng_dd_read "Step5 Final Read"; then
-      local rc=$?
-      if [[ $rc -eq 75 ]]; then echo "TEMP abort triggered. Resume later with --resume-ng"; exit 75; fi
-      ng_log_line "FAIL: final read verify failed"
-      ng_smart_snapshot "$NG_SMART_AFTER"
-      ng_certificate "FAIL" "$NG_CERT"
-      echo "NG pipeline FAILED (final read). Certificate: $NG_CERT"
-      exit 6
-    fi
-  fi
-
-  start_step=1
-done
-
-# Step 1: Pre-read
-  ng_draw 1 "Pre-read full surface scan"
-  if ! ng_dd_read "Step1 Pre-read"; then
-    ng_log_line "FAIL: pre-read failed"
-    ng_smart_snapshot "$NG_SMART_AFTER"
-    ng_certificate "FAIL" "$NG_CERT"
-    echo "NG pipeline FAILED (pre-read). Certificate: $NG_CERT"
-    exit 2
-  fi
-
-  # Step 2: badblocks
-  ng_draw 2 "badblocks multi-pattern destructive test"
-  if ! ng_badblocks "$bsz" "$ng_badblocks_patterns"; then
-    ng_log_line "FAIL: badblocks found errors"
-    ng_smart_snapshot "$NG_SMART_AFTER"
-    ng_certificate "FAIL" "$NG_CERT"
-    echo "NG pipeline FAILED (badblocks). Certificate: $NG_CERT"
-    exit 3
-  fi
-
-  # Step 3: SMART long self-test
-  if [[ "${ng_smart_long}" == "y" ]]; then
-    ng_draw 3 "SMART long self-test"
-    if ! ng_smart_long_test; then
-      ng_log_line "FAIL: SMART long self-test did not pass"
-      ng_smart_snapshot "$NG_SMART_AFTER"
-      ng_certificate "FAIL" "$NG_CERT"
-      echo "NG pipeline FAILED (SMART long). Certificate: $NG_CERT"
-      exit 4
-    fi
-  fi
-
-  # Step 4: zero write
-  ng_draw 4 "Full zero write"
-  if ! ng_dd_zero "Step4 Zero"; then
-    ng_log_line "FAIL: zero write failed"
-    ng_smart_snapshot "$NG_SMART_AFTER"
-    ng_certificate "FAIL" "$NG_CERT"
-    echo "NG pipeline FAILED (zero write). Certificate: $NG_CERT"
-    exit 5
-  fi
-
-  # Step 5: final read verify
-  ng_draw 5 "Final full read verify"
-  if ! ng_dd_read "Step5 Final read"; then
-    ng_log_line "FAIL: final read verify failed"
-    ng_smart_snapshot "$NG_SMART_AFTER"
-    ng_certificate "FAIL" "$NG_CERT"
-    echo "NG pipeline FAILED (final read). Certificate: $NG_CERT"
-    exit 6
-  fi
-
-  # Step 6: SMART delta + certificate
-  ng_draw 6 "Capturing SMART after + generating certificate"
-  ng_smart_snapshot "$NG_SMART_AFTER"
-  ng_smart_delta "$NG_SMART_BEFORE" "$NG_SMART_AFTER"
-  ng_certificate "PASS" "$NG_CERT"
-
-  ng_log_line "PASS: Preclear-NG pipeline finished successfully"
-  ng_draw 6 "DONE - PASS (certificate generated)"
-    ng_state_clear
-echo "NG pipeline PASSED. Certificate: $NG_CERT"
-  echo "Log: $NG_LOG"
-}
-
-
-# Remove empy lines
-sed -i '/^$/{:a;N;s/\n$//;ta}' $report
-
-# Save report to Flash disk
-mkdir -p "${PC_REPORT_DIR}"/
+# Save report to report directory
+mkdir -p "${PC_REPORT_DIR}/" 2>/dev/null || true
 date_formated=$(date "+%Y.%m.%d_%H.%M.%S")
 file_name=$(echo "preclear_report_${disk_properties[serial]}_${date_formated}.txt" | sed -e 's/[^A-Za-z0-9._-]/_/g')
-todos < $report > "${PC_REPORT_DIR}/${file_name}"
+if command -v todos >/dev/null 2>&1; then
+  # Convert to DOS newlines for Windows viewing
+  todos < "$report" > "${PC_REPORT_DIR}/${file_name}"
+else
+  cp -f "$report" "${PC_REPORT_DIR}/${file_name}" 2>/dev/null || true
+fi
 
-save_report "Yes" "$preread_speed" "$postread_speed" "$write_speed"
-
+save_report "Yes" "${preread_speed:-}" "${postread_speed:-}" "${write_speed:-}"
 do_exit
 
-
-# --- Added forensic extensions ---
-# SMART short/conveyance pretest
-# SMART error log & selftest log deltas
-# CRC cable/bridge failure gating
-# Cooldown + recheck phase
-# Optional fio random-read latency scan
-# Certificate summary output
