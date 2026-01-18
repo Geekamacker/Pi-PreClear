@@ -17,7 +17,7 @@ export LC_CTYPE
 # -----------------------------
 # Version / constants
 # -----------------------------
-VERSION="1.1.0"
+VERSION="1.1.0-dropin-v13"
 PLATFORM_NAME="Pi"
 
 readonly UI_WIDTH=120
@@ -157,6 +157,16 @@ die() {
 is_root() { [[ "${EUID:-$(id -u)}" -eq 0 ]]; }
 
 is_number() { [[ "$1" =~ ^[0-9]+$ ]]; }
+proc_io_bytes() {
+  local pid="$1" field="$2"
+  local v
+  v="$(awk -v f="${field}:" '$1==f{print $2}' /proc/${pid}/io 2>/dev/null || true)"
+  v=${v//[^0-9]/}
+  if [[ -n "$v" ]]; then
+    printf "%s" "$v"
+  fi
+}
+
 
 human_bytes() {
   local b="$1"
@@ -785,20 +795,35 @@ dd_wait_and_monitor() {
     local line=""
     if [[ -f "${CHILD_PROGRESS_FILE}" ]]; then
       # Convert CR to NL defensively, then take the last non-empty line
-      line="$(tr '\r' '\n' <"${CHILD_PROGRESS_FILE}" | awk 'NF{l=$0} END{print l}' 2>/dev/null || true)"
+      line="$(tr '
+' '
+' <"${CHILD_PROGRESS_FILE}" | awk 'NF{l=$0} END{print l}' 2>/dev/null || true)"
     fi
 
     # Parse bytes/speed if present (GNU dd: "<bytes> bytes ... copied, <sec> s, <speed>")
     local bytes="" speed=""
-    bytes="$(printf '%s\n' "$line" | awk '{print $1}' 2>/dev/null || true)"
+    bytes="$(printf '%s
+' "$line" | awk '{print $1}' 2>/dev/null || true)"
     bytes="${bytes//[^0-9]/}"
     if is_number "$bytes"; then
       CUR_BYTES=$bytes
     fi
 
-    speed="$(printf '%s\n' "$line" | awk -F',' '{gsub(/^[[:space:]]+/,"",$NF); print $NF}' 2>/dev/null || true)"
+    speed="$(printf '%s
+' "$line" | awk -F',' '{gsub(/^[[:space:]]+/,"",$NF); print $NF}' 2>/dev/null || true)"
     if [[ "$speed" == *"/s"* ]]; then
       CUR_SPEED="$speed"
+    fi
+
+    # Fallback: if dd output parsing did not yield bytes yet, read from /proc/<pid>/io (root only)
+    if (( CUR_BYTES == 0 )); then
+      local _field="read_bytes"
+      [[ "${CHILD_MODE}" == "write" ]] && _field="write_bytes"
+      local _pbytes
+      _pbytes="$(proc_io_bytes "${CHILD_PID}" "${_field}")"
+      if is_number "${_pbytes}" && (( _pbytes > 0 )); then
+        CUR_BYTES="${_pbytes}"
+      fi
     fi
 
     # Percent
