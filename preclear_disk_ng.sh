@@ -316,6 +316,20 @@ detect_disk_identity() {
   DISK_SECTOR_BYTES=$(blockdev --getss "$DISK" 2>/dev/null || echo 512)
   DISK_ROTA=$(lsblk -dn -o ROTA "$DISK" 2>/dev/null | head -n1 || echo 1)
 
+  # `blockdev` can return 0 on some USB bridges / unusual devices.
+  # Fall back to `lsblk -b` so progress math never divides by 0.
+  if (( DISK_SIZE_BYTES <= 0 )); then
+    local sz
+    sz=$(lsblk -b -dn -o SIZE "$DISK" 2>/dev/null | head -n1 || true)
+    if [[ "$sz" =~ ^[0-9]+$ ]] && (( sz > 0 )); then
+      DISK_SIZE_BYTES=$sz
+    fi
+  fi
+
+  if (( DISK_SIZE_BYTES <= 0 )); then
+    die "Unable to determine disk size for $DISK (blockdev/lsblk returned 0)."
+  fi
+
   # udev for model/serial
   local u
   u=$(udevadm info --query=property --name="$DISK" 2>/dev/null || true)
@@ -999,7 +1013,9 @@ CUR_CYCLE=1
 step_preread() {
   STEP_NUM=1
   STEP_NAME="Pre-read full surface scan"
-  local total_bytes="$DISK_BYTES"
+  # Total disk size in bytes. Use the canonical variable (DISK_SIZE_BYTES).
+  # (Older revisions used DISK_BYTES; keep this safe under `set -u`.)
+  local total_bytes="$DISK_SIZE_BYTES"
   local cmd
   local rc
 
@@ -1035,7 +1051,7 @@ step_badblocks() {
 step_zero() {
   STEP_NUM=3
   STEP_NAME="Zeroing the disk"
-  local total_bytes="$DISK_BYTES"
+  local total_bytes="$DISK_SIZE_BYTES"
   local cmd
   local rc
 
@@ -1061,7 +1077,7 @@ step_zero() {
 step_postread() {
   STEP_NUM=4
   STEP_NAME="Post-read verification"
-  local total_bytes="$DISK_BYTES"
+  local total_bytes="$DISK_SIZE_BYTES"
   local cmd
   local rc
 
