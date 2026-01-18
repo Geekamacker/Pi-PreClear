@@ -214,50 +214,11 @@ clear_screen() {
 # -----------------------------
 smartctl_type_arg() {
   case "$SMART_TYPE" in
-    auto) echo "";;
-    sat)  echo "-d sat";;
-    scsi) echo "-d scsi";;
-    ata)  echo "-d ata";;
-    nvme) echo "-d nvme";;
-    *)    echo "";;
+    auto|"" ) echo "";;
+    sat|sat,* ) echo "-d $SMART_TYPE";;
+    scsi|ata|nvme ) echo "-d $SMART_TYPE";;
+    * ) echo "";;
   esac
-}
-
-auto_detect_smart_type() {
-  local disk="$1"
-  # Try device types in order of likelihood
-  local types=(
-    ""              # Native SATA/ATA
-    "sat"           # SAT (SCSI/ATA Translation)
-    "sat,12"        # SAT with 12-byte commands (common USB bridges)
-    "sat,16"        # SAT with 16-byte commands
-    "scsi"          # SCSI direct
-    "ata"           # ATA direct
-    "usbsunplus"    # USB Sunplus bridge
-    "usbcypress"    # USB Cypress bridge
-    "usbjmicron"    # USB JMicron bridge
-    "usbjmicron,x"  # JMicron extended
-    "sat -T permissive" # Permissive SAT mode
-  )
-  
-  for type in "${types[@]}"; do
-    local type_arg=""
-    [[ -n "$type" ]] && type_arg="-d $type"
-    
-    # Test if this type returns valid SMART data
-    if timeout -s 9 10 smartctl $type_arg -i "$disk" 2>&1 | grep -q "START OF INFORMATION SECTION"; then
-      # Verify we can actually read attributes
-      if timeout -s 9 10 smartctl $type_arg -A "$disk" 2>&1 | grep -qE "ID#|Attribute"; then
-        [[ -n "$type" ]] && echo "$type" || echo "auto"
-        log "Auto-detected SMART type: ${type:-native}"
-        return 0
-      fi
-    fi
-  done
-  
-  log "WARNING: No working SMART device type found for $disk"
-  echo "none"
-  return 1
 }
 
 smartctl_run() {
@@ -271,10 +232,46 @@ smartctl_run() {
 
 smart_has_info() {
   local disk="$1"
-  if smartctl_run "$disk" | grep -q "START OF INFORMATION SECTION"; then
+  if smartctl_run "$disk" | grep -qiE "START OF INFORMATION SECTION|SMART (overall-health|Health Status)|SMART Attributes Data Structure"; then
     return 0
   fi
   return 1
+}
+
+
+# Try to auto-detect a working smartctl device type for this disk.
+# Many USB-SATA bridges require -d sat (or sat,12/sat,16).
+detect_smart_type() {
+  local disk="$1"
+  command -v smartctl >/dev/null 2>&1 || { echo "auto"; return 0; }
+
+  local t out
+  for t in auto sat scsi ata sat,12 sat,16; do
+    if [[ "$t" == "auto" ]]; then
+      out="$(timeout -s 9 10 smartctl -H "$disk" 2>/dev/null | tr -d '\r' | head -n 60)"
+    else
+      out="$(timeout -s 9 10 smartctl -d "$t" -H "$disk" 2>/dev/null | tr -d '\r' | head -n 60)"
+    fi
+
+    if echo "$out" | grep -qiE 'SMART overall-health|SMART Health Status|PASSED|OK'; then
+      echo "$t"
+      return 0
+    fi
+  done
+
+  echo "auto"
+}
+
+smart_autodetect_type_if_needed() {
+  # Respect explicit --smart-type; only auto-detect when set to auto/blank.
+  if [[ -z "${SMART_TYPE:-}" || "${SMART_TYPE}" == "auto" ]]; then
+    local detected
+    detected="$(detect_smart_type "$DISK")"
+    SMART_TYPE="$detected"
+    log "SMART device type: ${SMART_TYPE}"
+  else
+    log "SMART device type: ${SMART_TYPE} (forced)"
+  fi
 }
 
 smart_get_temp() {
@@ -318,15 +315,6 @@ detect_disk_identity() {
   DISK_SIZE_BYTES=$(blockdev --getsize64 "$DISK" 2>/dev/null || echo 0)
   DISK_SECTOR_BYTES=$(blockdev --getss "$DISK" 2>/dev/null || echo 512)
   DISK_ROTA=$(lsblk -dn -o ROTA "$DISK" 2>/dev/null | head -n1 || echo 1)
-
-  # Auto-detect SMART type if set to auto
-  if [[ "$SMART_TYPE" == "auto" ]]; then
-    SMART_TYPE=$(auto_detect_smart_type "$DISK")
-    if [[ "$SMART_TYPE" == "none" ]]; then
-      log "WARNING: SMART unavailable - disabling thermal monitoring"
-      TEMP_ENABLE="n"
-    fi
-  fi
 
   # udev for model/serial
   local u
@@ -731,111 +719,134 @@ render_ui() {
 # Progress parsing (dd)
 # -----------------------------
 start_dd_with_progress() {
-  # Args: mode(read|write), cmd array via global
   local mode="$1"
   local cmd_str="$2"
-  local progress_fifo="$3"
 
-  rm -f "$progress_fifo" 2>/dev/null || true
-  mkfifo "$progress_fifo"
+  mkdir -p "${PC_TMP_DIR}" 2>/dev/null || true
 
-  # Parser in background
+  # Progress file (stderr from dd + USR1 snapshots)
+  CHILD_PROGRESS_FILE="$(mktemp "${PC_TMP_DIR}/dd_${DISK_SERIAL}_${mode}.progress.XXXXXX")"
+  : >"${CHILD_PROGRESS_FILE}" || true
+
+  # Reset runtime vars
+  CUR_BYTES=0
+  CUR_SPEED=""
+  PERCENT=0
+  AVG_SPEED=""
+
+  CHILD_KIND="dd"
+  CHILD_MODE="$mode"
+  CHILD_CMD="$cmd_str"
+  CHILD_HANG=0
+  CHILD_LAST_BYTES=0
+  CHILD_START_AT="$(date +%s)"
+
+  # Run dd with stderr redirected to the progress file. We do NOT use status=progress
+  # because GNU dd uses carriage returns; instead we poll via SIGUSR1.
   (
-    local line
-    while IFS= read -r line; do
-      # dd status=progress line contains "bytes" and "copied"
-      # Example: "95189729280 bytes (95 GB, 89 GiB) copied, 892 s, 107 MB/s"
-      if [[ "$line" == *"bytes"*"copied"* ]]; then
-        local bytes speed
-        bytes=$(echo "$line" | awk '{print $1}' 2>/dev/null || true)
-        speed=$(echo "$line" | awk -F', ' '{print $3}' 2>/dev/null || true)
-        if is_number "${bytes:-}"; then
-          CUR_BYTES="$bytes"
-        fi
-        if [[ -n "${speed:-}" ]]; then
-          CUR_SPEED="$speed"
-        fi
-      fi
-    done < "$progress_fifo"
-  ) &
-  local parser_pid=$!
-
-  # Run dd, redirect stderr into fifo
-  # Use subshell to ensure fifo is closed when dd exits
-  (
-    eval "$cmd_str" 2> "$progress_fifo"
+    set +e
+    eval "$cmd_str" 2>>"${CHILD_PROGRESS_FILE}"
+    exit $?
   ) &
   CHILD_PID=$!
-  CHILD_KIND="dd"
-
-  # Ensure fifo cleanup on exit of dd
-  (
-    wait "$CHILD_PID" || true
-    # Close fifo by removing it
-    rm -f "$progress_fifo" 2>/dev/null || true
-    kill "$parser_pid" 2>/dev/null || true
-  ) &
 }
+
 
 dd_wait_and_monitor() {
   local total_bytes="$1"
-  local pid="$CHILD_PID"
 
-  CHILD_LAST_PROGRESS_AT=$(date +%s)
-  CHILD_LAST_BYTES="$CUR_BYTES"
+  local last_usr1_at=0
 
-  while kill -0 "$pid" 2>/dev/null; do
-    # compute percent and avg speed
-    if is_number "${CUR_BYTES:-}" && (( total_bytes > 0 )); then
-      PERCENT=$(( (CUR_BYTES * 100) / total_bytes ))
-      if (( PERCENT > 100 )); then PERCENT=100; fi
-    fi
-
+  while kill -0 "${CHILD_PID}" 2>/dev/null; do
     local now
-    now=$(date +%s)
-    local elapsed=$(( now - STEP_STARTED_AT ))
-    if (( elapsed > 0 )) && is_number "${CUR_BYTES:-}"; then
-      # bytes/sec -> MB/s
-      local bps=$(( CUR_BYTES / elapsed ))
-      AVG_SPEED=$(awk -v bps="$bps" 'BEGIN{printf "%.0f MB/s", bps/1024/1024}')
+    now="$(date +%s)"
+
+    # Ask dd for an instantaneous progress line (newline-terminated)
+    if (( now - last_usr1_at >= POLL_S )); then
+      kill -USR1 "${CHILD_PID}" 2>/dev/null || true
+      last_usr1_at=$now
     fi
 
-    # thermal
-    if [[ "$TEMP_ENABLE" == "y" ]]; then
-      thermal_poll
-      local rc=$?
-      if [[ "$rc" != "0" ]]; then
-        dd_escalate_stop "$pid" "thermal"
-        wait "$pid" 2>/dev/null || true
-        return "$rc"
-      fi
+    # Read latest progress line
+    local line=""
+    if [[ -f "${CHILD_PROGRESS_FILE}" ]]; then
+      # Convert CR to NL defensively, then take the last non-empty line
+      line="$(tr '\r' '\n' <"${CHILD_PROGRESS_FILE}" | awk 'NF{l=$0} END{print l}' 2>/dev/null || true)"
     fi
 
-    # hang detection (only when not paused)
-    if [[ "$CHILD_PAUSED" != "y" ]]; then
-      if is_number "${CUR_BYTES:-}" && (( CUR_BYTES == CHILD_LAST_BYTES )); then
-        local stalled=$(( now - CHILD_LAST_PROGRESS_AT ))
-        if (( stalled >= DD_HANG_KILL_S )); then
-          log "dd hang detected (${stalled}s no progress), killing"
-          dd_escalate_stop "$pid" "hang"
-          wait "$pid" 2>/dev/null || true
-          return 4
-        elif (( stalled >= DD_HANG_WARN_S )); then
-          log "dd stall warning (${stalled}s no progress)"
-        fi
+    # Parse bytes/speed if present (GNU dd: "<bytes> bytes ... copied, <sec> s, <speed>")
+    local bytes="" speed=""
+    bytes="$(printf '%s\n' "$line" | awk '{print $1}' 2>/dev/null || true)"
+    bytes="${bytes//[^0-9]/}"
+    if is_number "$bytes"; then
+      CUR_BYTES=$bytes
+    fi
+
+    speed="$(printf '%s\n' "$line" | awk -F',' '{gsub(/^[[:space:]]+/,"",$NF); print $NF}' 2>/dev/null || true)"
+    if [[ "$speed" == *"/s"* ]]; then
+      CUR_SPEED="$speed"
+    fi
+
+    # Percent
+    if is_number "$total_bytes" && (( total_bytes > 0 )) && is_number "$CUR_BYTES"; then
+      PERCENT=$(( (CUR_BYTES * 100) / total_bytes ))
+      (( PERCENT > 100 )) && PERCENT=100
+      (( PERCENT < 0 )) && PERCENT=0
+    else
+      PERCENT=0
+    fi
+
+    # Average speed
+    local elapsed
+    elapsed=$(( now - CHILD_START_AT ))
+    (( elapsed < 1 )) && elapsed=1
+    if is_number "$CUR_BYTES"; then
+      local bps
+      bps=$(( CUR_BYTES / elapsed ))
+      AVG_SPEED="$(human_rate "$bps")"
+    else
+      AVG_SPEED=""
+    fi
+
+    # Hang detection (bytes not increasing while not paused)
+    if is_number "$CUR_BYTES" && is_number "$CHILD_LAST_BYTES"; then
+      if (( CUR_BYTES == CHILD_LAST_BYTES )); then
+        CHILD_HANG=$((CHILD_HANG + 1))
       else
-        CHILD_LAST_BYTES="$CUR_BYTES"
-        CHILD_LAST_PROGRESS_AT="$now"
+        CHILD_HANG=0
+        CHILD_LAST_BYTES=$CUR_BYTES
       fi
     fi
 
-    render_ui
-    sleep "$REFRESH_S"
+    if (( CHILD_HANG > DD_HANG_THRESHOLD )); then
+      ng_log_line "dd appears hung (no progress for $((DD_HANG_THRESHOLD * POLL_S))s). Sending SIGTERM..."
+      kill -TERM "${CHILD_PID}" 2>/dev/null || true
+      sleep 2
+      ng_log_line "Sending SIGKILL..."
+      kill -KILL "${CHILD_PID}" 2>/dev/null || true
+      break
+    fi
+
+    # Thermal + UI
+    thermal_poll_maybe "$now"
+    ng_draw
+
+    sleep "${POLL_S}"
   done
 
-  # Process exited; collect status
-  wait "$pid"
+  local rc=0
+  if wait "${CHILD_PID}"; then
+    rc=0
+  else
+    rc=$?
+  fi
+
+  # One last USR1 snapshot (may fail if already exited)
+  kill -USR1 "${CHILD_PID}" 2>/dev/null || true
+
+  return "$rc"
 }
+
 
 dd_escalate_stop() {
   local pid="$1"; local why="$2"
@@ -988,32 +999,28 @@ CUR_CYCLE=1
 step_preread() {
   STEP_NUM=1
   STEP_NAME="Pre-read full surface scan"
-  STEP_STARTED_AT=$(date +%s)
-  thermal_init_for_step
-  CUR_BYTES=0; CUR_SPEED=""; AVG_SPEED=""; PERCENT=0
+  local total_bytes="$DISK_BYTES"
+  local cmd
+  local rc
 
-  local fifo="${PC_TMP_DIR}/dd_${DISK_SERIAL}_preread.fifo"
+  cmd="dd if=${DISK} of=/dev/null bs=${DD_BS_READ} iflag=direct"
+  ng_log_line "RUN: $cmd"
+  start_dd_with_progress "preread" "$cmd"
+  dd_wait_and_monitor "$total_bytes"
+  rc=$?
 
-  # Build dd command string (direct read preferred)
-  local cmd="dd if=${DISK} of=/dev/null bs=${DD_BS_READ} status=progress iflag=direct"
-  log "RUN: $cmd"
-
-  start_dd_with_progress "read" "$cmd" "$fifo"
-
-  if dd_wait_and_monitor "$DISK_SIZE_BYTES"; then
-    return 0
-  else
-    local rc=$?
-    # If invalid argument (direct unsupported), retry buffered
-    if [[ "$rc" -ne 0 ]]; then
-      log "Pre-read failed rc=${rc}; retrying without iflag=direct"
-      cmd="dd if=${DISK} of=/dev/null bs=${DD_BS_READ} status=progress"
-      start_dd_with_progress "read" "$cmd" "$fifo"
-      dd_wait_and_monitor "$DISK_SIZE_BYTES"
-      return $?
-    fi
+  if (( rc != 0 )); then
+    ng_log_line "Pre-read failed rc=${rc}; retrying without iflag=direct"
+    cmd="dd if=${DISK} of=/dev/null bs=${DD_BS_READ}"
+    ng_log_line "RUN: $cmd"
+    start_dd_with_progress "preread" "$cmd"
+    dd_wait_and_monitor "$total_bytes"
+    rc=$?
   fi
+
+  return "$rc"
 }
+
 
 step_badblocks() {
   STEP_NUM=2
@@ -1027,53 +1034,55 @@ step_badblocks() {
 
 step_zero() {
   STEP_NUM=3
-  STEP_NAME="Zero fill (write /dev/zero)"
-  STEP_STARTED_AT=$(date +%s)
-  thermal_init_for_step
-  CUR_BYTES=0; CUR_SPEED=""; AVG_SPEED=""; PERCENT=0
+  STEP_NAME="Zeroing the disk"
+  local total_bytes="$DISK_BYTES"
+  local cmd
+  local rc
 
-  local fifo="${PC_TMP_DIR}/dd_${DISK_SERIAL}_zero.fifo"
+  cmd="dd if=/dev/zero of=${DISK} bs=${DD_BS_WRITE} oflag=direct conv=fsync"
+  ng_log_line "RUN: $cmd"
+  start_dd_with_progress "zero" "$cmd"
+  dd_wait_and_monitor "$total_bytes"
+  rc=$?
 
-  local cmd="dd if=/dev/zero of=${DISK} bs=${DD_BS_WRITE} status=progress oflag=direct conv=fsync"
-  log "RUN: $cmd"
-
-  start_dd_with_progress "write" "$cmd" "$fifo"
-
-  if dd_wait_and_monitor "$DISK_SIZE_BYTES"; then
-    return 0
-  else
-    local rc=$?
-    log "Zero fill failed rc=${rc}; retrying without oflag=direct"
-    cmd="dd if=/dev/zero of=${DISK} bs=${DD_BS_WRITE} status=progress conv=fsync"
-    start_dd_with_progress "write" "$cmd" "$fifo"
-    dd_wait_and_monitor "$DISK_SIZE_BYTES"
+  if (( rc != 0 )); then
+    ng_log_line "Zeroing failed rc=${rc}; retrying without oflag=direct"
+    cmd="dd if=/dev/zero of=${DISK} bs=${DD_BS_WRITE} conv=fsync"
+    ng_log_line "RUN: $cmd"
+    start_dd_with_progress "zero" "$cmd"
+    dd_wait_and_monitor "$total_bytes"
+    rc=$?
   fi
+
+  return "$rc"
 }
+
 
 step_postread() {
   STEP_NUM=4
-  STEP_NAME="Post-read full surface scan"
-  STEP_STARTED_AT=$(date +%s)
-  thermal_init_for_step
-  CUR_BYTES=0; CUR_SPEED=""; AVG_SPEED=""; PERCENT=0
+  STEP_NAME="Post-read verification"
+  local total_bytes="$DISK_BYTES"
+  local cmd
+  local rc
 
-  local fifo="${PC_TMP_DIR}/dd_${DISK_SERIAL}_postread.fifo"
+  cmd="dd if=${DISK} of=/dev/null bs=${DD_BS_READ} iflag=direct"
+  ng_log_line "RUN: $cmd"
+  start_dd_with_progress "postread" "$cmd"
+  dd_wait_and_monitor "$total_bytes"
+  rc=$?
 
-  local cmd="dd if=${DISK} of=/dev/null bs=${DD_BS_READ} status=progress iflag=direct"
-  log "RUN: $cmd"
-
-  start_dd_with_progress "read" "$cmd" "$fifo"
-
-  if dd_wait_and_monitor "$DISK_SIZE_BYTES"; then
-    return 0
-  else
-    local rc=$?
-    log "Post-read failed rc=${rc}; retrying without iflag=direct"
-    cmd="dd if=${DISK} of=/dev/null bs=${DD_BS_READ} status=progress"
-    start_dd_with_progress "read" "$cmd" "$fifo"
-    dd_wait_and_monitor "$DISK_SIZE_BYTES"
+  if (( rc != 0 )); then
+    ng_log_line "Post-read failed rc=${rc}; retrying without iflag=direct"
+    cmd="dd if=${DISK} of=/dev/null bs=${DD_BS_READ}"
+    ng_log_line "RUN: $cmd"
+    start_dd_with_progress "postread" "$cmd"
+    dd_wait_and_monitor "$total_bytes"
+    rc=$?
   fi
+
+  return "$rc"
 }
+
 
 step_smart_finalize() {
   STEP_NUM=5
@@ -1186,6 +1195,9 @@ parse_args() {
       --cycles) CYCLES="${2:-}"; shift 2;;
       --resume-ng) RESUME="y"; shift;;
 
+      --pipeline-ng|--ng) shift;;
+      --legacy) die "Legacy pipeline removed; NG pipeline is now the only mode.";;
+
       --skip-preread) SKIP_PREREAD="y"; shift;;
       --skip-badblocks) SKIP_BADBLOCKS="y"; shift;;
       --skip-zero) SKIP_ZERO="y"; shift;;
@@ -1260,6 +1272,7 @@ main() {
   STATE_FILE="${PC_PLUGIN_DIR}/${DISK_SERIAL}.ng.state"
 
   log "Starting Preclear-NG unified pipeline on $DISK (serial=$DISK_SERIAL model=$DISK_MODEL)"
+  smart_autodetect_type_if_needed
 
   smart_init_snapshots
 
