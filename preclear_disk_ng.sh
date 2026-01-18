@@ -223,6 +223,43 @@ smartctl_type_arg() {
   esac
 }
 
+auto_detect_smart_type() {
+  local disk="$1"
+  # Try device types in order of likelihood
+  local types=(
+    ""              # Native SATA/ATA
+    "sat"           # SAT (SCSI/ATA Translation)
+    "sat,12"        # SAT with 12-byte commands (common USB bridges)
+    "sat,16"        # SAT with 16-byte commands
+    "scsi"          # SCSI direct
+    "ata"           # ATA direct
+    "usbsunplus"    # USB Sunplus bridge
+    "usbcypress"    # USB Cypress bridge
+    "usbjmicron"    # USB JMicron bridge
+    "usbjmicron,x"  # JMicron extended
+    "sat -T permissive" # Permissive SAT mode
+  )
+  
+  for type in "${types[@]}"; do
+    local type_arg=""
+    [[ -n "$type" ]] && type_arg="-d $type"
+    
+    # Test if this type returns valid SMART data
+    if timeout -s 9 10 smartctl $type_arg -i "$disk" 2>&1 | grep -q "START OF INFORMATION SECTION"; then
+      # Verify we can actually read attributes
+      if timeout -s 9 10 smartctl $type_arg -A "$disk" 2>&1 | grep -qE "ID#|Attribute"; then
+        [[ -n "$type" ]] && echo "$type" || echo "auto"
+        log "Auto-detected SMART type: ${type:-native}"
+        return 0
+      fi
+    fi
+  done
+  
+  log "WARNING: No working SMART device type found for $disk"
+  echo "none"
+  return 1
+}
+
 smartctl_run() {
   # Streams to stdout; caller can redirect. Returns smartctl exit.
   local disk="$1"
@@ -281,6 +318,15 @@ detect_disk_identity() {
   DISK_SIZE_BYTES=$(blockdev --getsize64 "$DISK" 2>/dev/null || echo 0)
   DISK_SECTOR_BYTES=$(blockdev --getss "$DISK" 2>/dev/null || echo 512)
   DISK_ROTA=$(lsblk -dn -o ROTA "$DISK" 2>/dev/null | head -n1 || echo 1)
+
+  # Auto-detect SMART type if set to auto
+  if [[ "$SMART_TYPE" == "auto" ]]; then
+    SMART_TYPE=$(auto_detect_smart_type "$DISK")
+    if [[ "$SMART_TYPE" == "none" ]]; then
+      log "WARNING: SMART unavailable - disabling thermal monitoring"
+      TEMP_ENABLE="n"
+    fi
+  fi
 
   # udev for model/serial
   local u
