@@ -171,33 +171,30 @@ smart_attr_table() {
     echo "(SMART attributes unavailable)"
     return 0
   fi
-  # Pick common attributes; fall back to whatever exists.
-  # Format: NAME VALUE
-  awk '
-    BEGIN{
-      want["Reallocated_Sector_Ct"]=1;
-      want["Power_On_Hours"]=1;
-      want["Runtime_Bad_Block"]=1;
-      want["End-to-End_Error"]=1;
-      want["Reported_Uncorrect"]=1;
-      want["Airflow_Temperature_Cel"]=1;
-      want["Temperature_Celsius"]=1;
-      want["Reallocated_Event_Count"]=1;
-      want["Current_Pending_Sector"]=1;
-      want["Offline_Uncorrectable"]=1;
-      want["UDMA_CRC_Error_Count"]=1;
-    }
-    /^ID#/ {in=1; next}
-    in && $1 ~ /^[0-9]+$/ {
-      name=$2;
-      raw=$NF;
-      if (want[name]) {
-        printf "%-24s %s\n", name, raw;
-        seen++;
+
+  awk 'BEGIN{
+        want["Reallocated_Sector_Ct"]=1;
+        want["Power_On_Hours"]=1;
+        want["Runtime_Bad_Block"]=1;
+        want["End-to-End_Error"]=1;
+        want["Reported_Uncorrect"]=1;
+        want["Airflow_Temperature_Cel"]=1;
+        want["Temperature_Celsius"]=1;
+        want["Reallocated_Event_Count"]=1;
+        want["Current_Pending_Sector"]=1;
+        want["Offline_Uncorrectable"]=1;
+        want["UDMA_CRC_Error_Count"]=1;
+        p=0; seen=0;
       }
-    }
-    END{ if (seen==0) print "(No preferred SMART attrs found)"; }
-  ' <<<"$s" | head -n 12
+      /^ID#/{p=1; next}
+      p && $1 ~ /^[0-9]+$/ {
+        name=$2; raw=$NF;
+        if (want[name]) {
+          printf "%-24s %s\n", name, raw;
+          seen++;
+        }
+      }
+      END{ if (seen==0) print "(No preferred SMART attrs found)"; }' <<<"$s" | head -n 20
 }
 
 state_write() {
@@ -651,8 +648,8 @@ smart_delta_small() {
   local tmpb tmpa
   tmpb=$(mktemp)
   tmpa=$(mktemp)
-  awk '/^ID#/{in=1;next} in && $1 ~ /^[0-9]+$/ {print $2" "$NF}' "$before" 2>/dev/null | sort >"$tmpb" || true
-  awk '/^ID#/{in=1;next} in && $1 ~ /^[0-9]+$/ {print $2" "$NF}' "$after" 2>/dev/null | sort >"$tmpa" || true
+  awk 'BEGIN{p=0} /^ID#/{p=1;next} p && $1 ~ /^[0-9]+$/ {print $2" "$NF}' "$before" 2>/dev/null | sort >"$tmpb" || true
+  awk 'BEGIN{p=0} /^ID#/{p=1;next} p && $1 ~ /^[0-9]+$/ {print $2" "$NF}' "$after" 2>/dev/null | sort >"$tmpa" || true
   join -a1 -a2 -e "?" -o 0,1.2,2.2 "$tmpb" "$tmpa" 2>/dev/null | awk '{printf "%-24s %10s -> %10s\n", $1, $2, $3}' | head -n 40 || true
   rm -f "$tmpb" "$tmpa" 2>/dev/null || true
 }
