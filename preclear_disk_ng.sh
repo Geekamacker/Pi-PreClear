@@ -427,10 +427,12 @@ run_dd_with_monitor() {
 
   local start_t now_t elapsed
   local last_bytes=0 last_t=0
+  local last_temp_t=0
   local cur_speed_bps=0 avg_speed_bps=0
 
   start_t=$(date +%s)
   last_t="$start_t"
+  last_temp_t="$start_t"
 
   # Spawn dd (no status=progress to avoid SIGPIPE issues)
   CHILD_PID=""
@@ -442,16 +444,15 @@ run_dd_with_monitor() {
     now_t=$(date +%s)
     elapsed=$((now_t - start_t))
 
-    # thermal check
-    if (( (now_t - last_t) >= TEMP_POLL_S )); then
-      if ! thermal_update; then
-        true
-      else
-        local trc=$?
-        if [[ $trc -eq 75 ]]; then
-          wait "$CHILD_PID" 2>/dev/null || true
-          return 75
-        fi
+    # thermal check (separate timer from speed sampling)
+    if (( (now_t - last_temp_t) >= TEMP_POLL_S )); then
+      thermal_update
+      local trc=$?
+      last_temp_t="$now_t"
+      if [[ $trc -eq 75 ]]; then
+        # abort requested due to thermal limit
+        wait "$CHILD_PID" 2>/dev/null || true
+        return 75
       fi
     fi
 
