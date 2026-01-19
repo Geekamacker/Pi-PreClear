@@ -1,175 +1,102 @@
 #!/usr/bin/env bash
+# Pi-PreClear NG (unified pipeline)
+# - Single pipeline (NG) only. Legacy pipeline removed.
+# - Designed for Raspberry Pi / Linux hosts.
+# - Steps: pre-read -> badblocks destructive (optional) -> smart long (optional) -> zero write -> final read -> smart delta + certificate
 #
-# Pi-PreClear NG (Unified Pipeline)
-# - Single pipeline (no legacy/unraid pipeline)
-# - Full-disk stress: pre-read -> badblocks (destructive patterns) -> zero-fill -> post-read
-# - Thermal monitoring with pause/resume/abort
-# - SMART deltas shown in a classic (Unraid-like) UI layout with SMART box pinned at bottom
-# - Resume at step boundaries (safe key=value state file; no sourcing arbitrary code)
-#
-# WARNING: This is destructive to the target disk.
+# NOTE: This script DESTRUCTIVELY tests/overwrites the target disk.
 
 set -Eeuo pipefail
 
-LC_CTYPE=C
-export LC_CTYPE
+VERSION="1.0.22-ng-unified"
 
-# -----------------------------
-# Version / constants
-# -----------------------------
-VERSION="1.1.0-dropin-v13"
-PLATFORM_NAME="Pi"
-
-readonly UI_WIDTH=120
-readonly UI_HEIGHT_TOP=11
-readonly UI_HEIGHT_SMART=14
-readonly DEFAULT_REFRESH_S=5
-readonly DEFAULT_SMART_REFRESH_S=300
-readonly DEFAULT_TEMP_POLL_S=5
-readonly DEFAULT_FAIL_MIN=10
-
-readonly DD_BS_READ="4M"
-readonly DD_BS_WRITE="4M"
-
-# Hang detection: seconds with no byte progress before escalation
-readonly DD_HANG_WARN_S=600      # 10 minutes
-readonly DD_HANG_KILL_S=1200     # 20 minutes
-
-# State / reports
-PC_BASE="/var/lib/preclear-ng"
-PC_PLUGIN_DIR="${PC_BASE}/pi-preclear"
-PC_REPORT_DIR="${PC_BASE}/preclear_reports"
-PC_TMP_DIR="/tmp/.preclear"
-
-# Fallback for non-root environments (still requires root to run destructive steps)
-if [[ ! -d "$PC_BASE" ]]; then
-  PC_BASE="$HOME/.preclear-ng"
-  PC_PLUGIN_DIR="${PC_BASE}/pi-preclear"
-  PC_REPORT_DIR="${PC_BASE}/preclear_reports"
-  PC_TMP_DIR="${PC_BASE}/tmp"
-fi
-
-mkdir -p "$PC_PLUGIN_DIR" "$PC_REPORT_DIR" "$PC_TMP_DIR" 2>/dev/null || true
-
-# Logging
-LOG_FILE="/var/log/preclear.disk.log"
-if [[ ! -d /var/log || ! -w /var/log ]]; then
-  LOG_FILE="${PC_BASE}/preclear.disk.log"
-fi
-
-# -----------------------------
-# Globals (kept minimal)
-# -----------------------------
-DISK=""
+# -------- defaults --------
 CYCLES=1
-NO_PROMPT="n"
-RESUME="n"
-
-# Steps: 1..6 (6 = certificate/report)
 START_STEP=1
+RESUME_NG="n"
+NO_PROMPT="n"
 
-# Pipeline toggles
-SKIP_PREREAD="n"
-SKIP_BADBLOCKS="n"
-SKIP_ZERO="n"
-SKIP_POSTREAD="n"
+# Thermal thresholds (C)
+TEMP_POLL_S=10
+PAUSE_C=50
+RESUME_C=45
+ABORT_C=55
 
-# badblocks options
-BB_BLOCKSIZE=""              # if empty, auto from logical sector size
-BB_PATTERNS="0xaa,0x55,0xff,0x00"
+# SMART
+SMART_TYPE="auto"          # smartctl -d <type>; "auto" means no -d
+SMART_REFRESH_S=120
 
-# SMART options
-SMART_TYPE="auto"            # auto|sat|scsi|ata|nvme
-SMART_LONG="n"               # run a long test before final SMART snapshot
+# I/O settings
+DD_BS="4M"
+TRY_DIRECT="y"             # try iflag/oflag=direct first (fallback automatically)
 
-# UI / refresh
-REFRESH_S=$DEFAULT_REFRESH_S
-SMART_REFRESH_S=$DEFAULT_SMART_REFRESH_S
+# Optional steps
+DO_BADBLOCKS="y"
+BADBLOCKS_BSZ="512"         # default; will auto-adjust to sector size if needed
+BADBLOCKS_PATTERNS=(0xaa 0x55 0xff 0x00)
+DO_SMART_LONG="n"
+DO_FIO_PROBE="y"
+FIO_LATENCY_S=10
+DO_HDPARM_TUNE="y"          # disable head-park (best-effort)
 
-# Thermal controls (defaults set after we detect HDD/SSD)
-TEMP_ENABLE="y"
-TEMP_POLL_S=$DEFAULT_TEMP_POLL_S
-TEMP_PAUSE_C=50
-TEMP_RESUME_C=45
-TEMP_ABORT_C=55
-TEMP_FAIL_MIN=$DEFAULT_FAIL_MIN
+# UI
+HUD_REFRESH_S=1
 
-# Derived / runtime
-DISK_SERIAL=""
+# Paths
+LOG_FILE="/var/log/preclear.disk.log"
+STATE_DIR="/var/lib/preclear-ng/pi-preclear"
+TMP_DIR="/tmp/.preclear"
+REPORT_DIR_DEFAULT="$HOME/preclear_reports"
+
+# -------- globals (initialized later) --------
+DISK=""
 DISK_MODEL=""
-DISK_SIZE_BYTES=0
-DISK_SECTOR_BYTES=512
-DISK_ROTA=1
+DISK_SERIAL=""
+DISK_BYTES=0
 
-STATE_FILE=""
-CERT_FILE=""
+NG_TEMP_CUR="n/a"
+NG_TEMP_MIN=""
+NG_TEMP_MAX=""
+NG_TEMP_STEP_MIN=""
+NG_TEMP_STEP_MAX=""
+NG_TEMP_ABOVE_PAUSE_S=0
+NG_TEMP_PAUSED_S=0
+NG_TEMP_PAUSED_AT=0
+NG_TEMP_IS_PAUSED="n"
 
-# Runtime stats
-STEP_NUM=1
-STEP_NAME=""
-STEP_STARTED_AT=0
-TOTAL_STARTED_AT=0
-
-CUR_BYTES=0
-CUR_SPEED=""
-AVG_SPEED=""
-PERCENT=0
-
-# Thermal stats
-TEMP_CUR=""
-TEMP_MIN=""
-TEMP_MAX=""
-TEMP_STEP_MIN=""
-TEMP_STEP_MAX=""
-TEMP_PAUSED_SECONDS=0
-TEMP_ABOVE_PAUSE_SECONDS=0
-TEMP_LAST_POLL=0
-TEMP_IS_PAUSED="n"
-
-# SMART snapshots
 SMART_INITIAL_FILE=""
-SMART_LAST_FILE=""
-SMART_LAST_AT=0
+SMART_BEFORE_FILE=""
+SMART_AFTER_FILE=""
+CERT_FILE=""
+STATE_FILE=""
 
-# Child process tracking
-CHILD_PID=0
-CHILD_KIND=""  # dd|badblocks
-CHILD_PAUSED="n"
-CHILD_LAST_BYTES=0
-CHILD_LAST_PROGRESS_AT=0
+CHILD_PID=""
 
-# -----------------------------
-# Helpers
-# -----------------------------
+# -------- helpers --------
+is_num() { [[ "${1:-}" =~ ^[0-9]+$ ]]; }
+
+ts_now() { date '+%b %d %T'; }
+
 log() {
   local msg="$*"
   local ts
-  ts="$(date '+%b %d %T')"
-  printf '%s preclear-ng: %s\n' "$ts" "$msg" >> "$LOG_FILE" 2>/dev/null || true
+  ts=$(ts_now)
+  printf '%s preclear-ng: %s\n' "$ts" "$msg" | tee -a "$LOG_FILE" >/dev/null || true
 }
 
+# Backward-compat alias used by older NG codepaths
+ng_log_line() { log "$@"; }
+
+warn() { echo "WARNING: $*" >&2; log "WARN: $*"; }
+
 die() {
-  log "FATAL: $*"
   echo "ERROR: $*" >&2
+  log "FATAL: $*"
   exit 1
 }
 
-is_root() { [[ "${EUID:-$(id -u)}" -eq 0 ]]; }
-
-is_number() { [[ "$1" =~ ^[0-9]+$ ]]; }
-proc_io_bytes() {
-  local pid="$1" field="$2"
-  local v
-  v="$(awk -v f="${field}:" '$1==f{print $2}' /proc/${pid}/io 2>/dev/null || true)"
-  v=${v//[^0-9]/}
-  if [[ -n "$v" ]]; then
-    printf "%s" "$v"
-  fi
-}
-
-
 human_bytes() {
-  local b="$1"
+  local b=${1:-0}
   awk -v b="$b" 'BEGIN{
     split("B KB MB GB TB PB", u, " ");
     i=1;
@@ -179,1211 +106,770 @@ human_bytes() {
   }'
 }
 
-hr_time() {
-  local s="$1"
-  awk -v s="$s" 'BEGIN{
-    h=int(s/3600); m=int((s%3600)/60); ss=int(s%60);
-    printf "%d:%02d:%02d", h,m,ss;
-  }'
-}
-
-box_line() {
-  local char="#"; local n=$UI_WIDTH
-  printf '%*s\n' "$n" '' | tr ' ' "$char"
-}
-
-pad_center() {
-  local text="$1"; local width=$UI_WIDTH
-  local len=${#text}
-  if (( len >= width-2 )); then
-    printf '# %s #\n' "${text:0:width-4}"
-    return
-  fi
-  local pad=$(( (width-4-len)/2 ))
-  local left=$(printf '%*s' "$pad" '')
-  local right=$(printf '%*s' "$((width-4-len-pad))" '')
-  printf '# %s%s%s #\n' "$left" "$text" "$right"
-}
-
-pad_lr() {
-  local left="$1"; local right="$2"; local width=$UI_WIDTH
-  local l=${#left}; local r=${#right}
-  local space=$((width-4-l-r))
-  (( space < 1 )) && space=1
-  printf '# %s%*s%s #\n' "$left" "$space" '' "$right"
-}
-
-clear_screen() {
-  if [[ -t 1 ]]; then
-    tput clear || true
-  fi
-}
-
-# -----------------------------
-# Disk / SMART detection
-# -----------------------------
 smartctl_type_arg() {
   case "$SMART_TYPE" in
-    auto|"" ) echo "";;
-    sat|sat,* ) echo "-d $SMART_TYPE";;
-    scsi|ata|nvme ) echo "-d $SMART_TYPE";;
-    * ) echo "";;
+    auto|"" ) echo "" ;;
+    * ) echo "-d $SMART_TYPE" ;;
   esac
 }
 
 smartctl_run() {
-  # Streams to stdout; caller can redirect. Returns smartctl exit.
   local disk="$1"
   local type_args
-  type_args="$(smartctl_type_arg)"
+  type_args=$(smartctl_type_arg)
   # shellcheck disable=SC2086
-  timeout -s 9 30 smartctl --all ${type_args} "$disk" 2>/dev/null
+  timeout -s 9 30 smartctl --all $type_args "$disk" 2>/dev/null
 }
 
 smart_has_info() {
   local disk="$1"
-  if smartctl_run "$disk" | grep -qiE "START OF INFORMATION SECTION|SMART (overall-health|Health Status)|SMART Attributes Data Structure"; then
-    return 0
-  fi
-  return 1
-}
-
-
-# Try to auto-detect a working smartctl device type for this disk.
-# Many USB-SATA bridges require -d sat (or sat,12/sat,16).
-detect_smart_type() {
-  local disk="$1"
-  command -v smartctl >/dev/null 2>&1 || { echo "auto"; return 0; }
-
-  local t out
-  for t in auto sat scsi ata sat,12 sat,16; do
-    if [[ "$t" == "auto" ]]; then
-      out="$(timeout -s 9 10 smartctl -H "$disk" 2>/dev/null | tr -d '\r' | head -n 60)"
-    else
-      out="$(timeout -s 9 10 smartctl -d "$t" -H "$disk" 2>/dev/null | tr -d '\r' | head -n 60)"
-    fi
-
-    if echo "$out" | grep -qiE 'SMART overall-health|SMART Health Status|PASSED|OK'; then
-      echo "$t"
-      return 0
-    fi
-  done
-
-  echo "auto"
-}
-
-smart_autodetect_type_if_needed() {
-  # Respect explicit --smart-type; only auto-detect when set to auto/blank.
-  if [[ -z "${SMART_TYPE:-}" || "${SMART_TYPE}" == "auto" ]]; then
-    local detected
-    detected="$(detect_smart_type "$DISK")"
-    SMART_TYPE="$detected"
-    log "SMART device type: ${SMART_TYPE}"
-  else
-    log "SMART device type: ${SMART_TYPE} (forced)"
-  fi
-}
-
-smart_get_temp() {
-  # best-effort: return numeric C or empty
-  local f="$1"
-  local t=""
-  # Prefer Temperature_Celsius, then Airflow_Temperature_Cel
-  t=$(grep -E "^(190|194)[[:space:]]+" "$f" 2>/dev/null | awk 'NR==1{print $(NF-1)}' | head -n1 || true)
-  if [[ -z "$t" ]]; then
-    # Some outputs have "Temperature:" in info section
-    t=$(grep -E "Temperature:" "$f" 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i ~ /^[0-9]+$/){print $i; exit}}' || true)
-  fi
-  if is_number "${t:-}"; then
-    echo "$t"
-  else
-    echo ""
-  fi
-}
-
-smart_extract_attr() {
-  # Args: file, attr_name -> value
-  local f="$1"; local name="$2"
-  awk -v n="$name" '
-    $0 ~ /^[0-9]+[[:space:]]+/ {
-      # smartctl -A: NAME in column 2
-      if ($2==n){print $(NF-1); exit}
-    }
-  ' "$f" 2>/dev/null || true
+  smartctl_run "$disk" | grep -qiE 'START OF INFORMATION SECTION|SMART (overall-health|Health Status)|SMART Attributes Data Structure'
 }
 
 smart_snapshot() {
   local out="$1"
   if smart_has_info "$DISK"; then
-    smartctl_run "$DISK" > "$out" || true
+    smartctl_run "$DISK" >"$out" || true
   else
-    : > "$out"
+    echo "SMART: unavailable (smartctl could not read drive)" >"$out"
   fi
 }
 
-detect_disk_identity() {
-  DISK_SIZE_BYTES=$(blockdev --getsize64 "$DISK" 2>/dev/null || echo 0)
-  DISK_SECTOR_BYTES=$(blockdev --getss "$DISK" 2>/dev/null || echo 512)
-  DISK_ROTA=$(lsblk -dn -o ROTA "$DISK" 2>/dev/null | head -n1 || echo 1)
+smart_temp_c() {
+  # Returns: integer temp in C, or "n/a"
+  local s
+  s=$(smartctl_run "$DISK" 2>/dev/null || true)
+  # Common fields:
+  #  -194 Temperature_Celsius / Airflow_Temperature_Cel
+  #  -Current Drive Temperature:
+  #  -Temperature:
+  local t
+  t=$(awk '
+    BEGIN{t=""}
+    /Current Drive Temperature:/ {for(i=1;i<=NF;i++){if($(i)~ /^[0-9]+$/){t=$(i); break}}}
+    /^[0-9]+[[:space:]]+(Temperature_Celsius|Airflow_Temperature_Cel)[[:space:]]/ {for(i=NF;i>=1;i--){if($(i)~ /^[0-9]+$/){t=$(i); break}}}
+    /Temperature:[[:space:]]+[0-9]+/ {for(i=1;i<=NF;i++){if($(i)~ /^[0-9]+$/){t=$(i); break}}}
+    END{print t}
+  ' <<<"$s")
 
-  # `blockdev` can return 0 on some USB bridges / unusual devices.
-  # Fall back to `lsblk -b` so progress math never divides by 0.
-  if (( DISK_SIZE_BYTES <= 0 )); then
-    local sz
-    sz=$(lsblk -b -dn -o SIZE "$DISK" 2>/dev/null | head -n1 || true)
-    if [[ "$sz" =~ ^[0-9]+$ ]] && (( sz > 0 )); then
-      DISK_SIZE_BYTES=$sz
+  if is_num "$t"; then echo "$t"; else echo "n/a"; fi
+}
+
+smart_health_line() {
+  local s
+  s=$(smartctl_run "$DISK" 2>/dev/null || true)
+  local h
+  h=$(grep -m1 -E 'SMART overall-health self-assessment test result:|SMART Health Status:' <<<"$s" || true)
+  [[ -n "$h" ]] && echo "$h" || echo "SMART health: n/a"
+}
+
+smart_attr_table() {
+  # Print a small, stable attribute table (Unraid-like) if available
+  local s
+  s=$(smartctl_run "$DISK" 2>/dev/null || true)
+  if ! grep -q "^ID#" <<<"$s"; then
+    echo "(SMART attributes unavailable)"
+    return 0
+  fi
+  # Pick common attributes; fall back to whatever exists.
+  # Format: NAME VALUE
+  awk '
+    BEGIN{
+      want["Reallocated_Sector_Ct"]=1;
+      want["Power_On_Hours"]=1;
+      want["Runtime_Bad_Block"]=1;
+      want["End-to-End_Error"]=1;
+      want["Reported_Uncorrect"]=1;
+      want["Airflow_Temperature_Cel"]=1;
+      want["Temperature_Celsius"]=1;
+      want["Reallocated_Event_Count"]=1;
+      want["Current_Pending_Sector"]=1;
+      want["Offline_Uncorrectable"]=1;
+      want["UDMA_CRC_Error_Count"]=1;
+    }
+    /^ID#/ {in=1; next}
+    in && $1 ~ /^[0-9]+$/ {
+      name=$2;
+      raw=$NF;
+      if (want[name]) {
+        printf "%-24s %s\n", name, raw;
+        seen++;
+      }
+    }
+    END{ if (seen==0) print "(No preferred SMART attrs found)"; }
+  ' <<<"$s" | head -n 12
+}
+
+state_write() {
+  local step="$1" cycle="$2"
+  umask 077
+  mkdir -p "$STATE_DIR" 2>/dev/null || true
+  cat >"$STATE_FILE" <<EOF
+step=$step
+cycle=$cycle
+paused_s=$NG_TEMP_PAUSED_S
+above_pause_s=$NG_TEMP_ABOVE_PAUSE_S
+EOF
+}
+
+state_load() {
+  # Secure-ish parse of key=value (no sourcing)
+  [[ -f "$STATE_FILE" ]] || return 1
+  local k v
+  while IFS='=' read -r k v; do
+    case "$k" in
+      step|cycle|paused_s|above_pause_s)
+        if is_num "$v"; then
+          case "$k" in
+            step) START_STEP="$v";;
+            cycle) CYCLES_CUR_START="$v";;
+            paused_s) NG_TEMP_PAUSED_S="$v";;
+            above_pause_s) NG_TEMP_ABOVE_PAUSE_S="$v";;
+          esac
+        fi
+      ;;
+    esac
+  done <"$STATE_FILE"
+  return 0
+}
+
+state_clear() {
+  rm -f "$STATE_FILE" 2>/dev/null || true
+}
+
+cleanup_child() {
+  if [[ -n "${CHILD_PID:-}" ]]; then
+    if kill -0 "$CHILD_PID" 2>/dev/null; then
+      kill -INT "$CHILD_PID" 2>/dev/null || true
+      sleep 1
+      kill -KILL "$CHILD_PID" 2>/dev/null || true
     fi
   fi
-
-  if (( DISK_SIZE_BYTES <= 0 )); then
-    die "Unable to determine disk size for $DISK (blockdev/lsblk returned 0)."
-  fi
-
-  # udev for model/serial
-  local u
-  u=$(udevadm info --query=property --name="$DISK" 2>/dev/null || true)
-  DISK_MODEL=$(printf '%s\n' "$u" | awk -F= '/^ID_MODEL=/{print $2; exit}')
-  DISK_SERIAL=$(printf '%s\n' "$u" | awk -F= '/^ID_SERIAL_SHORT=/{print $2; exit}')
-
-  # fallbacks
-  [[ -z "$DISK_MODEL" ]] && DISK_MODEL=$(lsblk -dn -o MODEL "$DISK" 2>/dev/null | head -n1 | xargs || true)
-  [[ -z "$DISK_SERIAL" ]] && DISK_SERIAL=$(lsblk -dn -o SERIAL "$DISK" 2>/dev/null | head -n1 | xargs || true)
-  [[ -z "$DISK_SERIAL" ]] && DISK_SERIAL="$(basename "$DISK")"
-
-  # defaults per drive type
-  if [[ "$DISK_ROTA" == "0" ]]; then
-    # SSD / flash
-    TEMP_PAUSE_C=${TEMP_PAUSE_C:-60}
-    TEMP_RESUME_C=${TEMP_RESUME_C:-55}
-    TEMP_ABORT_C=${TEMP_ABORT_C:-70}
-  else
-    TEMP_PAUSE_C=${TEMP_PAUSE_C:-50}
-    TEMP_RESUME_C=${TEMP_RESUME_C:-45}
-    TEMP_ABORT_C=${TEMP_ABORT_C:-55}
+  # If we left a child paused, resume it before exit
+  if [[ "$NG_TEMP_IS_PAUSED" == "y" && -n "${CHILD_PID:-}" ]]; then
+    kill -CONT "$CHILD_PID" 2>/dev/null || true
   fi
 }
 
-# -----------------------------
-# Safety checks
-# -----------------------------
-is_preclear_candidate() {
-  local disk="$1"
-  [[ -b "$disk" ]] || return 1
-
-  # Refuse if disk OR any partitions mounted
-  if lsblk -nro MOUNTPOINTS "$disk" 2>/dev/null | grep -qE '\S'; then
-    return 1
+on_exit() {
+  local rc=$?
+  cleanup_child
+  if [[ $rc -ne 0 ]]; then
+    log "EXIT (rc=$rc)"
   fi
+}
+trap on_exit EXIT
 
-  # Refuse if root is on this disk
-  local root_src
-  root_src=$(findmnt -nro SOURCE / 2>/dev/null || true)
-  if [[ -n "$root_src" ]]; then
-    local root_disk
-    root_disk=$(lsblk -no PKNAME "$root_src" 2>/dev/null | head -n1 || true)
-    if [[ -n "$root_disk" ]] && [[ "$disk" == "/dev/$root_disk" ]]; then
-      return 1
+thermal_update() {
+  local now temp
+  now=$(date +%s)
+  temp=$(smart_temp_c)
+  NG_TEMP_CUR="$temp"
+  if is_num "$temp"; then
+    # overall
+    if [[ -z "${NG_TEMP_MIN}" || "$temp" -lt "$NG_TEMP_MIN" ]]; then NG_TEMP_MIN="$temp"; fi
+    if [[ -z "${NG_TEMP_MAX}" || "$temp" -gt "$NG_TEMP_MAX" ]]; then NG_TEMP_MAX="$temp"; fi
+    # per-step
+    if [[ -z "${NG_TEMP_STEP_MIN}" || "$temp" -lt "$NG_TEMP_STEP_MIN" ]]; then NG_TEMP_STEP_MIN="$temp"; fi
+    if [[ -z "${NG_TEMP_STEP_MAX}" || "$temp" -gt "$NG_TEMP_STEP_MAX" ]]; then NG_TEMP_STEP_MAX="$temp"; fi
+
+    if (( temp >= PAUSE_C )); then
+      NG_TEMP_ABOVE_PAUSE_S=$((NG_TEMP_ABOVE_PAUSE_S + TEMP_POLL_S))
+    fi
+
+    # Pause/resume based on thresholds
+    if [[ -n "${CHILD_PID:-}" ]] && kill -0 "$CHILD_PID" 2>/dev/null; then
+      local state
+      state=$(ps -o state= -p "$CHILD_PID" 2>/dev/null | awk '{print $1}' || true)
+
+      if (( temp >= ABORT_C )); then
+        ng_log_line "TEMP ABORT: ${temp}C >= abort ${ABORT_C}C"
+        # Persist state so user can resume later
+        state_write "$STEP_NUM" "$CUR_CYCLE"
+        # Stop child quickly
+        kill -INT "$CHILD_PID" 2>/dev/null || true
+        sleep 1
+        kill -KILL "$CHILD_PID" 2>/dev/null || true
+        return 75
+      fi
+
+      # Pause
+      if (( temp >= PAUSE_C )) && [[ "$NG_TEMP_IS_PAUSED" != "y" ]]; then
+        ng_log_line "TEMP PAUSE: ${temp}C >= pause ${PAUSE_C}C"
+        kill -TSTP "$CHILD_PID" 2>/dev/null || true
+        NG_TEMP_IS_PAUSED="y"
+        NG_TEMP_PAUSED_AT="$now"
+      fi
+
+      # Track paused seconds only while actually paused
+      if [[ "$NG_TEMP_IS_PAUSED" == "y" ]]; then
+        # If something else already resumed it, sync state
+        if [[ "$state" != "T" ]]; then
+          NG_TEMP_IS_PAUSED="n"
+          NG_TEMP_PAUSED_AT=0
+        else
+          NG_TEMP_PAUSED_S=$((NG_TEMP_PAUSED_S + TEMP_POLL_S))
+        fi
+      fi
+
+      # Resume
+      if is_num "$temp" && (( temp <= RESUME_C )) && [[ "$NG_TEMP_IS_PAUSED" == "y" ]]; then
+        ng_log_line "TEMP RESUME: ${temp}C <= resume ${RESUME_C}C"
+        kill -CONT "$CHILD_PID" 2>/dev/null || true
+        NG_TEMP_IS_PAUSED="n"
+        NG_TEMP_PAUSED_AT=0
+      fi
     fi
   fi
 
   return 0
 }
 
-list_candidates() {
-  echo "========================================"
-  echo " Disks not currently mounted"
-  echo " (potential candidates for preclear)"
-  echo "========================================"
-  local name disk model serial size
-  while read -r name; do
-    [[ "$name" =~ ^(loop|zram|sr|mmcblk) ]] && continue
-    disk="/dev/$name"
-    [[ -b "$disk" ]] || continue
-    if ! is_preclear_candidate "$disk"; then
-      continue
-    fi
-    model=$(lsblk -dn -o MODEL "$disk" 2>/dev/null | head -n1 | xargs || true)
-    serial=$(lsblk -dn -o SERIAL "$disk" 2>/dev/null | head -n1 | xargs || true)
-    size=$(lsblk -dn -o SIZE "$disk" 2>/dev/null | head -n1 | xargs || true)
-    printf '%-10s %-10s %-30s %-20s\n' "$disk" "$size" "${model:-?}" "${serial:-?}"
-  done < <(lsblk -dn -o NAME)
+reset_step_thermal() {
+  NG_TEMP_STEP_MIN=""
+  NG_TEMP_STEP_MAX=""
+  NG_TEMP_ABOVE_PAUSE_S=0
+  # do not reset total paused time
+}
+
+fmt_hms() {
+  local s=${1:-0}
+  local h=$((s/3600)) m=$(((s%3600)/60)) ss=$((s%60))
+  printf '%d:%02d:%02d' "$h" "$m" "$ss"
+}
+
+read_proc_bytes() {
+  # Return bytes for dd based on mode: read or write
+  local pid="$1" mode="$2"
+  local f="/proc/$pid/io"
+  [[ -r "$f" ]] || { echo ""; return 0; }
+  case "$mode" in
+    read) awk '/read_bytes:/ {print $2}' "$f" 2>/dev/null || true ;;
+    write) awk '/write_bytes:/ {print $2}' "$f" 2>/dev/null || true ;;
+    *) echo "" ;;
+  esac
+}
+
+last_log_lines() {
+  if [[ -r "$LOG_FILE" ]]; then
+    tail -n 5 "$LOG_FILE" 2>/dev/null | tail -n 3
+  fi
+}
+
+draw_hud() {
+  # args: step_total step_num step_name pct elapsed_s cur_speed avg_speed
+  local step_total="$1" step_num="$2" step_name="$3" pct="$4" elapsed_s="$5" cur_sp="$6" avg_sp="$7"
+
+  local disktemp="$NG_TEMP_CUR"
+  local step_min="${NG_TEMP_STEP_MIN:-?}"
+  local step_max="${NG_TEMP_STEP_MAX:-?}"
+  local above_m=$((NG_TEMP_ABOVE_PAUSE_S/60))
+  local paused_m=$((NG_TEMP_PAUSED_S/60))
+
+  local w=116
+  local line
+  line=$(printf '%*s' "$w" '' | tr ' ' '#')
+
+  # Clear screen
+  if command -v tput >/dev/null 2>&1; then tput clear || true; else printf '\033c' || true; fi
+
+  echo "$line"
+  printf "# %-112s #\n" "Preclear-NG Pipeline (Pi / universal) - $DISK ($DISK_SERIAL)"
+  printf "# %-112s #\n" "Step ${step_num}/${step_total} - ${step_name}"
+  printf "# %-112s #\n" "Disk Temp: ${disktemp}C (step min ${step_min} / ${step_max})  above-pause ${above_m}m (total ${above_m}m)  paused ${paused_m}m  pause ${PAUSE_C}C resume ${RESUME_C}C abort ${ABORT_C}C"
+  echo "$line"
+
+  printf "# %-112s #\n" "Cycle ${CUR_CYCLE}/${CYCLES}  Progress: ${pct}%%  Elapsed: $(fmt_hms "$elapsed_s")  Speed: ${cur_sp}  Avg: ${avg_sp}"
+  echo "$line"
+
+  echo "# SMART Summary"
+  echo "$line"
+  smart_health_line
+  echo
+  printf "%-24s %s\n" "ATTRIBUTE" "RAW"
+  smart_attr_table
+
+  echo
+  echo "$line"
+  echo "# Last log lines:"
+  echo "$line"
+  last_log_lines
+  echo "$line"
 }
 
 confirm_destruction() {
-  if [[ "$NO_PROMPT" == "y" ]]; then
-    return 0
-  fi
-  echo ""
+  [[ "$NO_PROMPT" == "y" ]] && return 0
+  echo
   echo "WARNING: This will DESTRUCTIVELY test and overwrite: $DISK"
-  echo "Model: ${DISK_MODEL:-?}  Serial: ${DISK_SERIAL:-?}  Size: $(human_bytes "$DISK_SIZE_BYTES")"
-  echo ""
+  echo "Model: $DISK_MODEL  Serial: $DISK_SERIAL  Size: $(human_bytes "$DISK_BYTES")"
+  echo
   read -r -p "Type YES to continue: " ans
   [[ "$ans" == "YES" ]] || die "User aborted."
 }
 
-require_deps() {
-  command -v dd >/dev/null 2>&1 || die "Missing dd"
-  command -v badblocks >/dev/null 2>&1 || die "Missing badblocks (e2fsprogs)"
-  command -v smartctl >/dev/null 2>&1 || die "Missing smartctl (smartmontools)"
-  command -v timeout >/dev/null 2>&1 || die "Missing timeout"
-}
-
-# -----------------------------
-# State file (safe parsing)
-# -----------------------------
-write_state() {
-  local step="$1"
-  local cycle="$2"
-  local f="$STATE_FILE"
-  umask 077
-  {
-    echo "step_num=$step"
-    echo "cycle_num=$cycle"
-    echo "temp_min=${TEMP_MIN:-}"
-    echo "temp_max=${TEMP_MAX:-}"
-    echo "temp_paused_s=${TEMP_PAUSED_SECONDS:-0}"
-    echo "temp_above_pause_s=${TEMP_ABOVE_PAUSE_SECONDS:-0}"
-  } > "$f" 2>/dev/null || true
-}
-
-read_state() {
-  local f="$STATE_FILE"
-  [[ -f "$f" ]] || return 1
-
-  # safe ownership & perms: owned by root, not group/world-writable
-  local st
-  st=$(stat -c '%u %a' "$f" 2>/dev/null || echo "")
-  if [[ -n "$st" ]]; then
-    local uid perm
-    uid=${st%% *}; perm=${st##* }
-    if [[ "$uid" != "0" ]]; then
-      log "State file not owned by root; ignoring: $f"
-      return 1
-    fi
-    # perm is octal like 600; reject if group/world write
-    if (( (10#$perm) & 22 )); then
-      log "State file group/world-writable; ignoring: $f"
-      return 1
-    fi
-  fi
-
-  local k v
-  while IFS='=' read -r k v; do
-    case "$k" in
-      step_num) if is_number "$v" && (( v>=1 && v<=6 )); then START_STEP="$v"; fi;;
-      cycle_num) if is_number "$v" && (( v>=1 )); then :; fi;;
-      temp_min) if is_number "$v"; then TEMP_MIN="$v"; fi;;
-      temp_max) if is_number "$v"; then TEMP_MAX="$v"; fi;;
-      temp_paused_s) if is_number "$v"; then TEMP_PAUSED_SECONDS="$v"; fi;;
-      temp_above_pause_s) if is_number "$v"; then TEMP_ABOVE_PAUSE_SECONDS="$v"; fi;;
-    esac
-  done < "$f"
-  return 0
-}
-
-# -----------------------------
-# Thermal monitoring
-# -----------------------------
-thermal_init_for_step() {
-  TEMP_STEP_MIN=""
-  TEMP_STEP_MAX=""
-  TEMP_IS_PAUSED="n"
-  CHILD_PAUSED="n"
-  TEMP_LAST_POLL=$(date +%s)
-}
-
-thermal_update_minmax() {
-  local t="$1"
-  if ! is_number "$t"; then
-    return 0
-  fi
-  # global min/max
-  if [[ -z "${TEMP_MIN:-}" || "$t" -lt "$TEMP_MIN" ]]; then TEMP_MIN="$t"; fi
-  if [[ -z "${TEMP_MAX:-}" || "$t" -gt "$TEMP_MAX" ]]; then TEMP_MAX="$t"; fi
-  # step min/max
-  if [[ -z "${TEMP_STEP_MIN:-}" || "$t" -lt "$TEMP_STEP_MIN" ]]; then TEMP_STEP_MIN="$t"; fi
-  if [[ -z "${TEMP_STEP_MAX:-}" || "$t" -gt "$TEMP_STEP_MAX" ]]; then TEMP_STEP_MAX="$t"; fi
-}
-
-child_pause() {
-  local pid="$1"
-  if [[ "$pid" -gt 0 ]] && kill -0 "$pid" 2>/dev/null; then
-    kill -STOP "$pid" 2>/dev/null || true
-    CHILD_PAUSED="y"
-    TEMP_IS_PAUSED="y"
-  fi
-}
-
-child_resume() {
-  local pid="$1"
-  if [[ "$pid" -gt 0 ]] && kill -0 "$pid" 2>/dev/null; then
-    kill -CONT "$pid" 2>/dev/null || true
-    CHILD_PAUSED="n"
-    TEMP_IS_PAUSED="n"
-  fi
-}
-
-thermal_poll() {
-  [[ "$TEMP_ENABLE" == "y" ]] || return 0
-
-  local now dt
-  now=$(date +%s)
-  dt=$(( now - TEMP_LAST_POLL ))
-  (( dt < 0 )) && dt=0
-  TEMP_LAST_POLL="$now"
-
-  # Refresh cached SMART if needed to read temperature
-  maybe_refresh_smart
-  if [[ -n "$SMART_LAST_FILE" && -f "$SMART_LAST_FILE" ]]; then
-    local t
-    t=$(smart_get_temp "$SMART_LAST_FILE" || true)
-    if is_number "${t:-}"; then
-      TEMP_CUR="$t"
-      thermal_update_minmax "$t"
-    else
-      TEMP_CUR=""
-    fi
-  fi
-
-  # Nothing else to do if temp not numeric
-  if ! is_number "${TEMP_CUR:-}"; then
-    return 0
-  fi
-
-  # Track time above pause threshold
-  if (( TEMP_CUR >= TEMP_PAUSE_C )); then
-    TEMP_ABOVE_PAUSE_SECONDS=$(( TEMP_ABOVE_PAUSE_SECONDS + dt ))
-  fi
-
-  # Abort threshold
-  if (( TEMP_CUR >= TEMP_ABORT_C )); then
-    log "Thermal abort: ${TEMP_CUR}C >= ${TEMP_ABORT_C}C"
-    return 2
-  fi
-
-  # Pause / resume behavior
-  if (( TEMP_CUR >= TEMP_PAUSE_C )) && [[ "$CHILD_PAUSED" != "y" ]]; then
-    log "Thermal pause: ${TEMP_CUR}C >= ${TEMP_PAUSE_C}C"
-    child_pause "$CHILD_PID"
-  elif (( TEMP_CUR <= TEMP_RESUME_C )) && [[ "$CHILD_PAUSED" == "y" ]]; then
-    log "Thermal resume: ${TEMP_CUR}C <= ${TEMP_RESUME_C}C"
-    child_resume "$CHILD_PID"
-  fi
-
-  # Accumulate paused time only while actually paused
-  if [[ "$CHILD_PAUSED" == "y" ]]; then
-    TEMP_PAUSED_SECONDS=$(( TEMP_PAUSED_SECONDS + dt ))
-  fi
-
-  # Fail if stayed above pause threshold too long
-  if is_number "$TEMP_FAIL_MIN" && (( TEMP_FAIL_MIN > 0 )); then
-    local limit=$(( TEMP_FAIL_MIN * 60 ))
-    if (( TEMP_ABOVE_PAUSE_SECONDS >= limit )); then
-      log "Thermal fail: above-pause for ${TEMP_ABOVE_PAUSE_SECONDS}s (limit ${limit}s)"
-      return 3
-    fi
-  fi
-
-  return 0
-}
-
-# -----------------------------
-# SMART caching + rendering
-# -----------------------------
-maybe_refresh_smart() {
-  local now
-  now=$(date +%s)
-  if [[ -z "$SMART_LAST_FILE" ]]; then
-    SMART_LAST_FILE="${PC_TMP_DIR}/smart_${DISK_SERIAL}_last.txt"
-  fi
-  if (( SMART_LAST_AT == 0 || now - SMART_LAST_AT >= SMART_REFRESH_S )); then
-    smart_snapshot "$SMART_LAST_FILE"
-    SMART_LAST_AT="$now"
-  fi
-}
-
-smart_init_snapshots() {
-  SMART_INITIAL_FILE="${PC_TMP_DIR}/smart_${DISK_SERIAL}_initial.txt"
-  SMART_LAST_FILE="${PC_TMP_DIR}/smart_${DISK_SERIAL}_last.txt"
-  smart_snapshot "$SMART_INITIAL_FILE"
-  cp -f "$SMART_INITIAL_FILE" "$SMART_LAST_FILE" 2>/dev/null || true
-  SMART_LAST_AT=$(date +%s)
-}
-
-smart_render_box() {
-  local width=$UI_WIDTH
-
-  local initial_realloc initial_pend initial_unc initial_crc initial_hours initial_temp
-  local current_realloc current_pend current_unc current_crc current_hours current_temp
-
-  if [[ -s "$SMART_INITIAL_FILE" && -s "$SMART_LAST_FILE" ]]; then
-    initial_realloc=$(smart_extract_attr "$SMART_INITIAL_FILE" Reallocated_Sector_Ct)
-    initial_pend=$(smart_extract_attr "$SMART_INITIAL_FILE" Current_Pending_Sector)
-    initial_unc=$(smart_extract_attr "$SMART_INITIAL_FILE" Offline_Uncorrectable)
-    initial_crc=$(smart_extract_attr "$SMART_INITIAL_FILE" UDMA_CRC_Error_Count)
-    initial_hours=$(smart_extract_attr "$SMART_INITIAL_FILE" Power_On_Hours)
-    initial_temp=$(smart_get_temp "$SMART_INITIAL_FILE")
-
-    current_realloc=$(smart_extract_attr "$SMART_LAST_FILE" Reallocated_Sector_Ct)
-    current_pend=$(smart_extract_attr "$SMART_LAST_FILE" Current_Pending_Sector)
-    current_unc=$(smart_extract_attr "$SMART_LAST_FILE" Offline_Uncorrectable)
-    current_crc=$(smart_extract_attr "$SMART_LAST_FILE" UDMA_CRC_Error_Count)
-    current_hours=$(smart_extract_attr "$SMART_LAST_FILE" Power_On_Hours)
-    current_temp=$(smart_get_temp "$SMART_LAST_FILE")
-  else
-    initial_realloc=""; initial_pend=""; initial_unc=""; initial_crc=""; initial_hours=""; initial_temp=""
-    current_realloc=""; current_pend=""; current_unc=""; current_crc=""; current_hours=""; current_temp=""
-  fi
-
-  box_line
-  pad_center "S.M.A.R.T. Status (device type: ${SMART_TYPE})"
-  pad_lr "" ""
-
-  # Header
-  pad_lr "ATTRIBUTE" "INITIAL   CURRENT   STATUS"
-
-  smart_attr_line "Reallocated_Sector_Ct" "$initial_realloc" "$current_realloc"
-  smart_attr_line "Power_On_Hours" "$initial_hours" "$current_hours"
-  smart_attr_line "Temperature_Celsius" "$initial_temp" "$current_temp"
-  smart_attr_line "Current_Pending_Sector" "$initial_pend" "$current_pend"
-  smart_attr_line "Offline_Uncorrectable" "$initial_unc" "$current_unc"
-  smart_attr_line "UDMA_CRC_Error_Count" "$initial_crc" "$current_crc"
-
-  pad_lr "" ""
-
-  # Overall health (best-effort)
-  local health="UNKNOWN"
-  if [[ -s "$SMART_LAST_FILE" ]]; then
-    if grep -q "SMART overall-health self-assessment test result: PASSED" "$SMART_LAST_FILE"; then
-      health="PASSED"
-    elif grep -q "SMART overall-health self-assessment test result:" "$SMART_LAST_FILE"; then
-      health=$(grep -m1 "SMART overall-health self-assessment test result:" "$SMART_LAST_FILE" | awk -F: '{print $2}' | xargs)
-      [[ -z "$health" ]] && health="UNKNOWN"
-    fi
-  fi
-
-  pad_lr "SMART overall-health self-assessment test result: ${health}" ""
-  box_line
-}
-
-smart_attr_line() {
-  local name="$1"; local init="$2"; local cur="$3"
-  local status="-"
-
-  # Normalize empties
-  [[ -z "$init" ]] && init="-"
-  [[ -z "$cur" ]] && cur="-"
-
-  # Status up/down only if both numeric
-  if is_number "${init:-}" && is_number "${cur:-}"; then
-    if (( cur > init )); then status="Up $((cur-init))";
-    elif (( cur < init )); then status="Down $((init-cur))";
-    else status="-";
-    fi
-  fi
-
-  # Left and right formatting
-  local left
-  left=$(printf '%-24s' "$name")
-  local right
-  right=$(printf '%-8s %-8s %-10s' "$init" "$cur" "$status")
-  pad_lr "$left" "$right"
-}
-
-# -----------------------------
-# UI rendering (classic layout)
-# -----------------------------
-render_ui() {
-  local step_line
-  local disk_temp_display
-
-  if is_number "${TEMP_CUR:-}"; then
-    disk_temp_display="${TEMP_CUR}C"
-  else
-    disk_temp_display="n/aC"
-  fi
-
-  clear_screen
-
-  box_line
-  pad_lr "" ""
-  pad_center "Preclear-NG Pipeline (${PLATFORM_NAME} / universal) - ${DISK} (${DISK_SERIAL})"
-  pad_center "Cycle ${CUR_CYCLE} of ${CYCLES}" 
-  pad_lr "" ""
-
-  step_line="Step ${STEP_NUM} of 6 - ${STEP_NAME}:"
-
-  # progress right text
-  local right="(${PERCENT}% Done)"
-  pad_lr "  ${step_line}" "${right}"
-
-  pad_lr "" ""
-  pad_lr "  Disk Temp: ${disk_temp_display} (step min ${TEMP_STEP_MIN:-?} / ${TEMP_STEP_MAX:-?})  above-pause $(hr_time "$TEMP_ABOVE_PAUSE_SECONDS") (total)  paused $(hr_time "$TEMP_PAUSED_SECONDS")  pause ${TEMP_PAUSE_C}C resume ${TEMP_RESUME_C}C abort ${TEMP_ABORT_C}C fail>${TEMP_FAIL_MIN}m" ""
-
-  pad_lr "" ""
-
-  local elapsed_step=$(( $(date +%s) - STEP_STARTED_AT ))
-  local elapsed_total=$(( $(date +%s) - TOTAL_STARTED_AT ))
-
-  local cur_speed_display="${CUR_SPEED:-?}"
-  local avg_speed_display="${AVG_SPEED:-?}"
-
-  pad_lr "  ** Time elapsed: $(hr_time "$elapsed_step") | Current speed: ${cur_speed_display} | Average speed: ${avg_speed_display}" ""
-  box_line
-
-  pad_lr "  Cycle elapsed time: $(hr_time "$elapsed_total") | Total elapsed time: $(hr_time "$elapsed_total")" ""
-  box_line
-
-  # SMART box pinned at bottom
-  smart_render_box
-}
-
-# -----------------------------
-# Progress parsing (dd)
-# -----------------------------
-start_dd_with_progress() {
-  local mode="$1"
-  local cmd_str="$2"
-
-  mkdir -p "${PC_TMP_DIR}" 2>/dev/null || true
-
-  # Progress file (stderr from dd + USR1 snapshots)
-  CHILD_PROGRESS_FILE="$(mktemp "${PC_TMP_DIR}/dd_${DISK_SERIAL}_${mode}.progress.XXXXXX")"
-  : >"${CHILD_PROGRESS_FILE}" || true
-
-  # Reset runtime vars
-  CUR_BYTES=0
-  CUR_SPEED=""
-  PERCENT=0
-  AVG_SPEED=""
-
-  CHILD_KIND="dd"
-  CHILD_MODE="$mode"
-  CHILD_CMD="$cmd_str"
-  CHILD_HANG=0
-  CHILD_LAST_BYTES=0
-  CHILD_START_AT="$(date +%s)"
-
-  # Run dd with stderr redirected to the progress file. We do NOT use status=progress
-  # because GNU dd uses carriage returns; instead we poll via SIGUSR1.
-  (
-    set +e
-    eval "$cmd_str" 2>>"${CHILD_PROGRESS_FILE}"
-    exit $?
-  ) &
-  CHILD_PID=$!
-}
-
-
-dd_wait_and_monitor() {
-  local total_bytes="$1"
-
-  local last_usr1_at=0
-
-  while kill -0 "${CHILD_PID}" 2>/dev/null; do
-    local now
-    now="$(date +%s)"
-
-    # Ask dd for an instantaneous progress line (newline-terminated)
-    if (( now - last_usr1_at >= POLL_S )); then
-      kill -USR1 "${CHILD_PID}" 2>/dev/null || true
-      last_usr1_at=$now
-    fi
-
-    # Read latest progress line
-    local line=""
-    if [[ -f "${CHILD_PROGRESS_FILE}" ]]; then
-      # Convert CR to NL defensively, then take the last non-empty line
-      line="$(tr '
-' '
-' <"${CHILD_PROGRESS_FILE}" | awk 'NF{l=$0} END{print l}' 2>/dev/null || true)"
-    fi
-
-    # Parse bytes/speed if present (GNU dd: "<bytes> bytes ... copied, <sec> s, <speed>")
-    local bytes="" speed=""
-    bytes="$(printf '%s
-' "$line" | awk '{print $1}' 2>/dev/null || true)"
-    bytes="${bytes//[^0-9]/}"
-    if is_number "$bytes"; then
-      CUR_BYTES=$bytes
-    fi
-
-    speed="$(printf '%s
-' "$line" | awk -F',' '{gsub(/^[[:space:]]+/,"",$NF); print $NF}' 2>/dev/null || true)"
-    if [[ "$speed" == *"/s"* ]]; then
-      CUR_SPEED="$speed"
-    fi
-
-    # Fallback: if dd output parsing did not yield bytes yet, read from /proc/<pid>/io (root only)
-    if (( CUR_BYTES == 0 )); then
-      local _field="read_bytes"
-      [[ "${CHILD_MODE}" == "write" ]] && _field="write_bytes"
-      local _pbytes
-      _pbytes="$(proc_io_bytes "${CHILD_PID}" "${_field}")"
-      if is_number "${_pbytes}" && (( _pbytes > 0 )); then
-        CUR_BYTES="${_pbytes}"
-      fi
-    fi
-
-    # Percent
-    if is_number "$total_bytes" && (( total_bytes > 0 )) && is_number "$CUR_BYTES"; then
-      PERCENT=$(( (CUR_BYTES * 100) / total_bytes ))
-      (( PERCENT > 100 )) && PERCENT=100
-      (( PERCENT < 0 )) && PERCENT=0
-    else
-      PERCENT=0
-    fi
-
-    # Average speed
-    local elapsed
-    elapsed=$(( now - CHILD_START_AT ))
-    (( elapsed < 1 )) && elapsed=1
-    if is_number "$CUR_BYTES"; then
-      local bps
-      bps=$(( CUR_BYTES / elapsed ))
-      AVG_SPEED="$(human_rate "$bps")"
-    else
-      AVG_SPEED=""
-    fi
-
-    # Hang detection (bytes not increasing while not paused)
-    if is_number "$CUR_BYTES" && is_number "$CHILD_LAST_BYTES"; then
-      if (( CUR_BYTES == CHILD_LAST_BYTES )); then
-        CHILD_HANG=$((CHILD_HANG + 1))
-      else
-        CHILD_HANG=0
-        CHILD_LAST_BYTES=$CUR_BYTES
-      fi
-    fi
-
-    if (( CHILD_HANG > DD_HANG_THRESHOLD )); then
-      ng_log_line "dd appears hung (no progress for $((DD_HANG_THRESHOLD * POLL_S))s). Sending SIGTERM..."
-      kill -TERM "${CHILD_PID}" 2>/dev/null || true
-      sleep 2
-      ng_log_line "Sending SIGKILL..."
-      kill -KILL "${CHILD_PID}" 2>/dev/null || true
-      break
-    fi
-
-    # Thermal + UI
-    thermal_poll_maybe "$now"
-    ng_draw
-
-    sleep "${POLL_S}"
-  done
-
-  local rc=0
-  if wait "${CHILD_PID}"; then
-    rc=0
-  else
-    rc=$?
-  fi
-
-  # One last USR1 snapshot (may fail if already exited)
-  kill -USR1 "${CHILD_PID}" 2>/dev/null || true
-
-  return "$rc"
-}
-
-
-dd_escalate_stop() {
-  local pid="$1"; local why="$2"
-  [[ "$pid" -gt 0 ]] || return 0
-  if ! kill -0 "$pid" 2>/dev/null; then
-    return 0
-  fi
-  log "Stopping dd (reason=${why})"
-  kill -TERM "$pid" 2>/dev/null || true
-  sleep 2
-  if kill -0 "$pid" 2>/dev/null; then
-    kill -KILL "$pid" 2>/dev/null || true
-  fi
-}
-
-# -----------------------------
-# badblocks runner
-# -----------------------------
-badblocks_run_patterns() {
-  local total_bytes="$1"
-
-  local bs="$BB_BLOCKSIZE"
-  if [[ -z "$bs" ]]; then
-    bs="$DISK_SECTOR_BYTES"
-  fi
-
-  # Parse patterns list
-  IFS=',' read -r -a patterns <<< "$BB_PATTERNS"
-
-  local pat_index=0
-  local pat_total=${#patterns[@]}
-  (( pat_total == 0 )) && return 0
-
-  for pat in "${patterns[@]}"; do
-    pat=$(echo "$pat" | xargs)
-    ((pat_index++))
-
-    # badblocks progress will be approximate; reset bytes and percent per pattern
-    CUR_BYTES=0
-    PERCENT=0
-    CUR_SPEED=""
-    AVG_SPEED=""
-
-    # FIFO to capture stderr progress
-    local fifo="${PC_TMP_DIR}/bb_${DISK_SERIAL}.fifo"
-    rm -f "$fifo" 2>/dev/null || true
-    mkfifo "$fifo"
-
-    (
-      local line
-      while IFS= read -r line; do
-        # badblocks -s uses carriage returns; we may get fragments; try to extract percent
-        if [[ "$line" =~ ([0-9]{1,3})% ]]; then
-          local p=${BASH_REMATCH[1]}
-          if is_number "$p"; then
-            PERCENT="$p"
-          fi
-        fi
-      done < "$fifo"
-    ) &
-    local parser_pid=$!
-
-    # Run badblocks destructive write/read pass for this pattern
-    # -w: destructive write-test
-    # -s: show progress
-    # -v: verbose
-    # -b: block size
-    # -t: test pattern
-    # We do exactly 1 pass per pattern.
-    (
-      badblocks -wsv -b "$bs" -t "$pat" "$DISK" 2> "$fifo"
-    ) &
-    CHILD_PID=$!
-    CHILD_KIND="badblocks"
-
-    thermal_init_for_step
-
-    while kill -0 "$CHILD_PID" 2>/dev/null; do
-      # thermal
-      if [[ "$TEMP_ENABLE" == "y" ]]; then
-        thermal_poll
-        local rc=$?
-        if [[ "$rc" != "0" ]]; then
-          log "Stopping badblocks (thermal rc=${rc})"
-          kill -TERM "$CHILD_PID" 2>/dev/null || true
-          sleep 2
-          kill -KILL "$CHILD_PID" 2>/dev/null || true
-          wait "$CHILD_PID" 2>/dev/null || true
-          kill "$parser_pid" 2>/dev/null || true
-          rm -f "$fifo" 2>/dev/null || true
-          return "$rc"
-        fi
-      fi
-
-      # UI (pattern context goes in STEP_NAME)
-      render_ui
-      sleep "$REFRESH_S"
-    done
-
-    wait "$CHILD_PID"
-    local rc=$?
-
-    kill "$parser_pid" 2>/dev/null || true
-    rm -f "$fifo" 2>/dev/null || true
-
-    if [[ "$rc" != "0" ]]; then
-      log "badblocks failed for pattern ${pat} (rc=${rc})"
-      return "$rc"
-    fi
-
-    # Reset pause state between patterns
-    CHILD_PAUSED="n"
-  done
-
-  return 0
-}
-
-# -----------------------------
-# Optional extras
-# -----------------------------
 maybe_hdparm_tune() {
-  # Best-effort: reduce head parking / spindown interactions during long tests.
-  # No failure if hdparm missing.
+  [[ "$DO_HDPARM_TUNE" == "y" ]] || return 0
   command -v hdparm >/dev/null 2>&1 || return 0
-  # Disable standby timer (if supported)
+  # Best-effort: disable spindown timer
   hdparm -S 0 "$DISK" >/dev/null 2>&1 || true
 }
 
 maybe_fio_probe() {
+  [[ "$DO_FIO_PROBE" == "y" ]] || return 0
   command -v fio >/dev/null 2>&1 || return 0
-  # Quick read latency probe (non-destructive): 10s random read
-  log "fio latency probe (10s)"
-  fio --name=preclear_ng_probe --filename="$DISK" --direct=1 --rw=randread --bs=4k --iodepth=16 --time_based --runtime=10 --numjobs=1 --group_reporting >/dev/null 2>&1 || true
+  log "fio latency probe (${FIO_LATENCY_S}s)"
+  fio --name=preclear_ng_probe --filename="$DISK" --direct=1 --rw=randread --bs=4k --iodepth=16 --time_based --runtime="$FIO_LATENCY_S" --numjobs=1 --group_reporting >/dev/null 2>&1 || true
 }
 
-maybe_smart_long_test() {
-  [[ "$SMART_LONG" == "y" ]] || return 0
-  log "Starting SMART long test"
-  local type_args
-  type_args="$(smartctl_type_arg)"
-  # shellcheck disable=SC2086
-  smartctl -t long ${type_args} "$DISK" >/dev/null 2>&1 || true
-}
+run_dd_with_monitor() {
+  # args: mode(read|write) label dd_args...
+  local mode="$1" label="$2"; shift 2
 
-# -----------------------------
-# Steps
-# -----------------------------
-CUR_CYCLE=1
+  local start_t now_t elapsed
+  local last_bytes=0 last_t=0
+  local cur_speed_bps=0 avg_speed_bps=0
+
+  start_t=$(date +%s)
+  last_t="$start_t"
+
+  # Spawn dd (no status=progress to avoid SIGPIPE issues)
+  CHILD_PID=""
+  ( "$@" ) &
+  CHILD_PID=$!
+
+  # Monitor loop
+  while kill -0 "$CHILD_PID" 2>/dev/null; do
+    now_t=$(date +%s)
+    elapsed=$((now_t - start_t))
+
+    # thermal check
+    if (( (now_t - last_t) >= TEMP_POLL_S )); then
+      if ! thermal_update; then
+        true
+      else
+        local trc=$?
+        if [[ $trc -eq 75 ]]; then
+          wait "$CHILD_PID" 2>/dev/null || true
+          return 75
+        fi
+      fi
+    fi
+
+    local bytes
+    bytes=$(read_proc_bytes "$CHILD_PID" "$mode")
+    if is_num "$bytes"; then
+      if (( now_t > last_t )); then
+        cur_speed_bps=$(( (bytes - last_bytes) / (now_t - last_t) ))
+      fi
+      if (( elapsed > 0 )); then
+        avg_speed_bps=$(( bytes / elapsed ))
+      fi
+      last_bytes="$bytes"
+      last_t="$now_t"
+
+      local pct=0
+      if (( DISK_BYTES > 0 )); then
+        pct=$(( (bytes * 100) / DISK_BYTES ))
+        if (( pct > 100 )); then pct=100; fi
+      fi
+      draw_hud 6 "$STEP_NUM" "$STEP_NAME" "$pct" "$elapsed" "$(human_bytes "$cur_speed_bps")/s" "$(human_bytes "$avg_speed_bps")/s"
+    else
+      draw_hud 6 "$STEP_NUM" "$STEP_NAME" "0" "$elapsed" "n/a" "n/a"
+    fi
+
+    sleep "$HUD_REFRESH_S"
+  done
+
+  wait "$CHILD_PID" || return $?
+  return 0
+}
 
 step_preread() {
   STEP_NUM=1
   STEP_NAME="Pre-read full surface scan"
-  # Total disk size in bytes. Use the canonical variable (DISK_SIZE_BYTES).
-  # (Older revisions used DISK_BYTES; keep this safe under `set -u`.)
-  local total_bytes="$DISK_SIZE_BYTES"
-  local cmd
-  local rc
+  reset_step_thermal
 
-  cmd="dd if=${DISK} of=/dev/null bs=${DD_BS_READ} iflag=direct"
-  ng_log_line "RUN: $cmd"
-  start_dd_with_progress "preread" "$cmd"
-  dd_wait_and_monitor "$total_bytes"
-  rc=$?
+  log "RUN: dd if=$DISK of=/dev/null bs=$DD_BS"$([[ "$TRY_DIRECT" == "y" ]] && echo " iflag=direct" || true)
 
-  if (( rc != 0 )); then
-    ng_log_line "Pre-read failed rc=${rc}; retrying without iflag=direct"
-    cmd="dd if=${DISK} of=/dev/null bs=${DD_BS_READ}"
-    ng_log_line "RUN: $cmd"
-    start_dd_with_progress "preread" "$cmd"
-    dd_wait_and_monitor "$total_bytes"
-    rc=$?
+  if [[ "$TRY_DIRECT" == "y" ]]; then
+    if run_dd_with_monitor read "$STEP_NAME" dd if="$DISK" of=/dev/null bs="$DD_BS" iflag=direct; then
+      return 0
+    fi
+    local rc=$?
+    if [[ $rc -eq 75 ]]; then return 75; fi
+    log "Pre-read failed rc=$rc; retrying without iflag=direct"
   fi
 
-  return "$rc"
-}
-
-
-step_badblocks() {
-  STEP_NUM=2
-  STEP_NAME="Badblocks destructive patterns"
-  STEP_STARTED_AT=$(date +%s)
-  thermal_init_for_step
-  CUR_BYTES=0; CUR_SPEED=""; AVG_SPEED=""; PERCENT=0
-
-  badblocks_run_patterns "$DISK_SIZE_BYTES"
+  run_dd_with_monitor read "$STEP_NAME" dd if="$DISK" of=/dev/null bs="$DD_BS"
 }
 
 step_zero() {
-  STEP_NUM=3
-  STEP_NAME="Zeroing the disk"
-  local total_bytes="$DISK_SIZE_BYTES"
-  local cmd
-  local rc
-
-  cmd="dd if=/dev/zero of=${DISK} bs=${DD_BS_WRITE} oflag=direct conv=fsync"
-  ng_log_line "RUN: $cmd"
-  start_dd_with_progress "zero" "$cmd"
-  dd_wait_and_monitor "$total_bytes"
-  rc=$?
-
-  if (( rc != 0 )); then
-    ng_log_line "Zeroing failed rc=${rc}; retrying without oflag=direct"
-    cmd="dd if=/dev/zero of=${DISK} bs=${DD_BS_WRITE} conv=fsync"
-    ng_log_line "RUN: $cmd"
-    start_dd_with_progress "zero" "$cmd"
-    dd_wait_and_monitor "$total_bytes"
-    rc=$?
-  fi
-
-  return "$rc"
-}
-
-
-step_postread() {
   STEP_NUM=4
-  STEP_NAME="Post-read verification"
-  local total_bytes="$DISK_SIZE_BYTES"
-  local cmd
-  local rc
+  STEP_NAME="Full zero write"
+  reset_step_thermal
 
-  cmd="dd if=${DISK} of=/dev/null bs=${DD_BS_READ} iflag=direct"
-  ng_log_line "RUN: $cmd"
-  start_dd_with_progress "postread" "$cmd"
-  dd_wait_and_monitor "$total_bytes"
-  rc=$?
+  log "RUN: dd if=/dev/zero of=$DISK bs=$DD_BS"$([[ "$TRY_DIRECT" == "y" ]] && echo " oflag=direct" || true)
 
-  if (( rc != 0 )); then
-    ng_log_line "Post-read failed rc=${rc}; retrying without iflag=direct"
-    cmd="dd if=${DISK} of=/dev/null bs=${DD_BS_READ}"
-    ng_log_line "RUN: $cmd"
-    start_dd_with_progress "postread" "$cmd"
-    dd_wait_and_monitor "$total_bytes"
-    rc=$?
+  if [[ "$TRY_DIRECT" == "y" ]]; then
+    if run_dd_with_monitor write "$STEP_NAME" dd if=/dev/zero of="$DISK" bs="$DD_BS" oflag=direct conv=fsync; then
+      return 0
+    fi
+    local rc=$?
+    if [[ $rc -eq 75 ]]; then return 75; fi
+    log "Zero write failed rc=$rc; retrying without oflag=direct"
   fi
 
-  return "$rc"
+  run_dd_with_monitor write "$STEP_NAME" dd if=/dev/zero of="$DISK" bs="$DD_BS" conv=fsync
 }
 
-
-step_smart_finalize() {
+step_finalread() {
   STEP_NUM=5
-  STEP_NAME="SMART final snapshot & deltas"
-  STEP_STARTED_AT=$(date +%s)
-  thermal_init_for_step
-  PERCENT=100
+  STEP_NAME="Final full read verify"
+  reset_step_thermal
 
-  # Refresh SMART now
-  smart_snapshot "$SMART_LAST_FILE"
-  SMART_LAST_AT=$(date +%s)
+  log "RUN: dd if=$DISK of=/dev/null bs=$DD_BS"$([[ "$TRY_DIRECT" == "y" ]] && echo " iflag=direct" || true)
 
-  # render a couple times for visibility
-  render_ui
-  sleep 2
-  render_ui
+  if [[ "$TRY_DIRECT" == "y" ]]; then
+    if run_dd_with_monitor read "$STEP_NAME" dd if="$DISK" of=/dev/null bs="$DD_BS" iflag=direct; then
+      return 0
+    fi
+    local rc=$?
+    if [[ $rc -eq 75 ]]; then return 75; fi
+    log "Final read failed rc=$rc; retrying without iflag=direct"
+  fi
+
+  run_dd_with_monitor read "$STEP_NAME" dd if="$DISK" of=/dev/null bs="$DD_BS"
+}
+
+monitor_badblocks() {
+  # args: pid logfile
+  local pid="$1" lf="$2"
+  local start_t now_t elapsed pct
+  start_t=$(date +%s)
+
+  while kill -0 "$pid" 2>/dev/null; do
+    now_t=$(date +%s)
+    elapsed=$((now_t - start_t))
+
+    # thermal check
+    if (( (now_t - start_t) % TEMP_POLL_S == 0 )); then
+      local trc
+      thermal_update || trc=$?
+      if [[ ${trc:-0} -eq 75 ]]; then
+        kill -INT "$pid" 2>/dev/null || true
+        wait "$pid" 2>/dev/null || true
+        return 75
+      fi
+    fi
+
+    pct=$(grep -oE '[0-9]+(\.[0-9]+)?% done' "$lf" 2>/dev/null | tail -n 1 | awk '{print $1}' | tr -d '%' || true)
+    if ! is_num "${pct%%.*}"; then pct=0; fi
+
+    draw_hud 6 "$STEP_NUM" "$STEP_NAME" "${pct%%.*}" "$elapsed" "n/a" "n/a"
+    sleep "$HUD_REFRESH_S"
+  done
+
+  wait "$pid" || return $?
+  return 0
+}
+
+step_badblocks() {
+  STEP_NUM=2
+  STEP_NAME="badblocks multi-pattern destructive test"
+  reset_step_thermal
+
+  command -v badblocks >/dev/null 2>&1 || { warn "badblocks not installed; skipping"; return 0; }
+
+  # Pick a sane block size: at least sector size
+  local sector
+  sector=$(blockdev --getss "$DISK" 2>/dev/null || echo 512)
+  if is_num "$sector" && (( BADBLOCKS_BSZ < sector )); then
+    BADBLOCKS_BSZ="$sector"
+  fi
+
+  local lf="$TMP_DIR/badblocks_${DISK_SERIAL}.log"
+  : >"$lf"
+
+  # Build command
+  local cmd=(badblocks -wsv -b "$BADBLOCKS_BSZ")
+  local p
+  for p in "${BADBLOCKS_PATTERNS[@]}"; do
+    cmd+=( -t "$p" )
+  done
+  cmd+=( "$DISK" )
+
+  log "RUN: ${cmd[*]}"
+
+  ( "${cmd[@]}" ) >"$lf" 2>&1 &
+  CHILD_PID=$!
+
+  monitor_badblocks "$CHILD_PID" "$lf"
+}
+
+step_smart_long() {
+  STEP_NUM=3
+  STEP_NAME="SMART long self-test"
+  reset_step_thermal
+
+  command -v smartctl >/dev/null 2>&1 || { warn "smartctl not installed; skipping"; return 0; }
+
+  log "RUN: smartctl -t long $(smartctl_type_arg) $DISK"
+  # shellcheck disable=SC2046,SC2086
+  if ! timeout -s 9 30 smartctl -t long $(smartctl_type_arg) "$DISK" >/dev/null 2>&1; then
+    warn "smartctl long-test command failed to start; skipping"
+    return 0
+  fi
+
+  # Poll every 60s for completion
+  local start_t now_t elapsed
+  start_t=$(date +%s)
+  while :; do
+    now_t=$(date +%s)
+    elapsed=$((now_t - start_t))
+
+    # thermal check
+    thermal_update || true
+
+    local s
+    s=$(smartctl_run "$DISK" 2>/dev/null || true)
+    # crude completion check
+    if grep -qiE 'Self-test routine in progress|in progress' <<<"$s"; then
+      draw_hud 6 "$STEP_NUM" "$STEP_NAME" "0" "$elapsed" "n/a" "n/a"
+      sleep 60
+      continue
+    fi
+    break
+  done
 
   return 0
 }
 
-step_certificate() {
-  STEP_NUM=6
-  STEP_NAME="Certificate / report"
-  STEP_STARTED_AT=$(date +%s)
-  PERCENT=100
-
-  CERT_FILE="${PC_REPORT_DIR}/preclear-ng_certificate_${DISK_SERIAL}_$(date +%Y.%m.%d_%H.%M.%S).txt"
-
-  {
-    echo "Preclear-NG Pipeline Certificate"
-    echo "==============================="
-    echo "Date: $(date)"
-    echo "Disk: ${DISK}"
-    echo "Model: ${DISK_MODEL}"
-    echo "Serial: ${DISK_SERIAL}"
-    echo "Size: $(human_bytes "$DISK_SIZE_BYTES")"
-    echo "Sector size: ${DISK_SECTOR_BYTES}"
-    echo "Rotational: ${DISK_ROTA}"
-    echo ""
-    echo "Thermal:"
-    echo "  temp_min=${TEMP_MIN:-n/a}C temp_max=${TEMP_MAX:-n/a}C"
-    echo "  paused_time=$(hr_time "$TEMP_PAUSED_SECONDS")"
-    echo "  above_pause_time=$(hr_time "$TEMP_ABOVE_PAUSE_SECONDS") (limit ${TEMP_FAIL_MIN}m)"
-    echo "  thresholds: pause=${TEMP_PAUSE_C}C resume=${TEMP_RESUME_C}C abort=${TEMP_ABORT_C}C"
-    echo ""
-    echo "SMART initial and final snapshots saved:" 
-    echo "  initial: ${SMART_INITIAL_FILE}"
-    echo "  final:   ${SMART_LAST_FILE}"
-    echo ""
-    echo "SMART (final) excerpt:"
-    echo "----------------------"
-    if [[ -s "$SMART_LAST_FILE" ]]; then
-      grep -E "SMART overall-health|^(190|194|5|9|187|197|198|199)[[:space:]]" "$SMART_LAST_FILE" || true
-    else
-      echo "(SMART unavailable)"
-    fi
-  } > "$CERT_FILE"
-
-  log "Certificate: $CERT_FILE"
-
-  render_ui
-  echo ""
-  echo "NG pipeline completed. Certificate: $CERT_FILE"
+smart_delta_small() {
+  local before="$1" after="$2"
+  echo "SMART delta (selected attrs):"
+  local tmpb tmpa
+  tmpb=$(mktemp)
+  tmpa=$(mktemp)
+  awk '/^ID#/{in=1;next} in && $1 ~ /^[0-9]+$/ {print $2" "$NF}' "$before" 2>/dev/null | sort >"$tmpb" || true
+  awk '/^ID#/{in=1;next} in && $1 ~ /^[0-9]+$/ {print $2" "$NF}' "$after" 2>/dev/null | sort >"$tmpa" || true
+  join -a1 -a2 -e "?" -o 0,1.2,2.2 "$tmpb" "$tmpa" 2>/dev/null | awk '{printf "%-24s %10s -> %10s\n", $1, $2, $3}' | head -n 40 || true
+  rm -f "$tmpb" "$tmpa" 2>/dev/null || true
 }
 
-# -----------------------------
-# Argument parsing
-# -----------------------------
+write_certificate() {
+  local result="$1"
+  mkdir -p "$REPORT_DIR" 2>/dev/null || true
+  {
+    echo "Pi-PreClear NG certificate"
+    echo "Version: $VERSION"
+    echo "Date: $(date -Is)"
+    echo "Disk: $DISK"
+    echo "Model: $DISK_MODEL"
+    echo "Serial: $DISK_SERIAL"
+    echo "Size: $(human_bytes "$DISK_BYTES")"
+    echo "Result: $result"
+    echo
+    echo "-- SMART BEFORE --"
+    cat "$SMART_BEFORE_FILE" 2>/dev/null || true
+    echo
+    echo "-- SMART AFTER --"
+    cat "$SMART_AFTER_FILE" 2>/dev/null || true
+    echo
+    smart_delta_small "$SMART_BEFORE_FILE" "$SMART_AFTER_FILE" || true
+  } >"$CERT_FILE"
+}
+
 usage() {
   cat <<EOF
 Usage: sudo $0 [options] /dev/sdX
 
 Options:
-  --help                   Show this help
-  --version                Print version
-  -l, --list               List candidate disks (not mounted)
-  -j, --no-prompt           Do not prompt (DANGEROUS)
-  --cycles N               Number of cycles (default 1)
-  --resume-ng              Resume from last saved step boundary
+  --cycles N                Number of cycles (default: $CYCLES)
+  --start-step N            Start at step N (1..6) (default: $START_STEP)
+  --resume-ng               Resume from state file (step/cycle) (safe parse)
+  --no-prompt               Do not ask to type YES
 
-  --skip-preread           Skip step 1
-  --skip-badblocks         Skip step 2
-  --skip-zero              Skip step 3
-  --skip-postread          Skip step 4
+  --smart-type TYPE         smartctl -d TYPE (auto|sat|scsi|usbjmicron|...) (default: $SMART_TYPE)
+  --smart-long              Include SMART long self-test step (step 3)
 
-  --badblocks-patterns CSV Default: 0xaa,0x55,0xff,0x00
-  --badblocks-blocksize N  Override badblocks block size (default: logical sector)
+  --no-badblocks            Skip badblocks destructive step
+  --badblocks-bsz N         badblocks block size (default: $BADBLOCKS_BSZ)
 
-  --smart-type TYPE        auto|sat|scsi|ata|nvme (default auto)
-  --smart-long             Start SMART long test (non-blocking)
+  --pause-c N               Pause threshold C (default: $PAUSE_C)
+  --resume-c N              Resume threshold C (default: $RESUME_C)
+  --abort-c N               Abort threshold C (default: $ABORT_C)
 
-  --temp-disable           Disable temperature monitoring
-  --temp-pause C           Pause threshold (C)
-  --temp-resume C          Resume threshold (C)
-  --temp-abort C           Abort threshold (C)
-  --temp-interval S        Temperature poll interval (seconds)
-  --temp-fail-min M        Fail if above pause for M minutes (default 10)
+  --no-direct               Do not attempt direct I/O first
+  --no-fio                  Skip fio latency probe
+  --no-hdparm               Skip hdparm tune
+
+Compatibility:
+  --pipeline-ng             Accepted (no-op); pipeline is always NG now.
 
 EOF
 }
 
 parse_args() {
-  local argv=("$@")
-  while (( $# )); do
+  local args=()
+  while [[ $# -gt 0 ]]; do
     case "$1" in
-      --help|-h) usage; exit 0;;
-      --version) echo "$0 version: $VERSION"; exit 0;;
-      -l|--list) list_candidates; exit 0;;
-      -j|--no-prompt) NO_PROMPT="y"; shift;;
       --cycles) CYCLES="${2:-}"; shift 2;;
-      --resume-ng) RESUME="y"; shift;;
-
-      --pipeline-ng|--ng) shift;;
-      --legacy) die "Legacy pipeline removed; NG pipeline is now the only mode.";;
-
-      --skip-preread) SKIP_PREREAD="y"; shift;;
-      --skip-badblocks) SKIP_BADBLOCKS="y"; shift;;
-      --skip-zero) SKIP_ZERO="y"; shift;;
-      --skip-postread) SKIP_POSTREAD="y"; shift;;
-
-      --badblocks-patterns) BB_PATTERNS="${2:-}"; shift 2;;
-      --badblocks-blocksize) BB_BLOCKSIZE="${2:-}"; shift 2;;
+      --start-step) START_STEP="${2:-}"; shift 2;;
+      --resume-ng) RESUME_NG="y"; shift;;
+      --no-prompt) NO_PROMPT="y"; shift;;
 
       --smart-type) SMART_TYPE="${2:-}"; shift 2;;
-      --smart-long) SMART_LONG="y"; shift;;
+      --smart-long) DO_SMART_LONG="y"; shift;;
 
-      --temp-disable) TEMP_ENABLE="n"; shift;;
-      --temp-pause) TEMP_PAUSE_C="${2:-}"; shift 2;;
-      --temp-resume) TEMP_RESUME_C="${2:-}"; shift 2;;
-      --temp-abort) TEMP_ABORT_C="${2:-}"; shift 2;;
-      --temp-interval) TEMP_POLL_S="${2:-}"; shift 2;;
-      --temp-fail-min) TEMP_FAIL_MIN="${2:-}"; shift 2;;
+      --no-badblocks) DO_BADBLOCKS="n"; shift;;
+      --badblocks-bsz) BADBLOCKS_BSZ="${2:-}"; shift 2;;
 
-      --) shift; break;;
+      --pause-c) PAUSE_C="${2:-}"; shift 2;;
+      --resume-c) RESUME_C="${2:-}"; shift 2;;
+      --abort-c) ABORT_C="${2:-}"; shift 2;;
+
+      --no-direct) TRY_DIRECT="n"; shift;;
+      --no-fio) DO_FIO_PROBE="n"; shift;;
+      --no-hdparm) DO_HDPARM_TUNE="n"; shift;;
+
+      --pipeline-ng) shift;;
+      -h|--help) usage; exit 0;;
       -*) die "Unknown option: $1";;
-      *)
-        # disk
-        if [[ -z "$DISK" ]]; then
-          DISK="$1"
-          shift
-        else
-          die "Unexpected argument: $1"
-        fi
-        ;;
+      *) args+=("$1"); shift;;
     esac
   done
 
-  # If disk not set and leftover args exist
-  if [[ -z "$DISK" && $# -gt 0 ]]; then
-    DISK="$1"
+  if [[ ${#args[@]} -ne 1 ]]; then
+    usage
+    die "Must provide exactly one disk device (e.g., /dev/sda)."
   fi
+  DISK="${args[0]}"
 
-  # Validate numeric args
-  is_number "$CYCLES" || die "--cycles must be numeric"
-  (( CYCLES >= 1 )) || die "--cycles must be >= 1"
-
-  if [[ -n "$BB_BLOCKSIZE" ]]; then
-    is_number "$BB_BLOCKSIZE" || die "--badblocks-blocksize must be numeric"
-  fi
-
-  if [[ "$TEMP_ENABLE" == "y" ]]; then
-    is_number "$TEMP_PAUSE_C" || die "--temp-pause must be numeric"
-    is_number "$TEMP_RESUME_C" || die "--temp-resume must be numeric"
-    is_number "$TEMP_ABORT_C" || die "--temp-abort must be numeric"
-    is_number "$TEMP_POLL_S" || die "--temp-interval must be numeric"
-    is_number "$TEMP_FAIL_MIN" || die "--temp-fail-min must be numeric"
-  fi
+  is_num "$CYCLES" || die "--cycles must be numeric"
+  is_num "$START_STEP" || die "--start-step must be numeric"
+  (( START_STEP >= 1 && START_STEP <= 6 )) || die "--start-step must be 1..6"
 }
 
-# -----------------------------
-# Main
-# -----------------------------
+init_disk_info() {
+  [[ -b "$DISK" ]] || die "Not a block device: $DISK."
+
+  DISK_BYTES=$(blockdev --getsize64 "$DISK" 2>/dev/null || echo 0)
+  is_num "$DISK_BYTES" || DISK_BYTES=0
+  (( DISK_BYTES > 0 )) || die "Could not determine disk size for $DISK"
+
+  mkdir -p "$TMP_DIR" 2>/dev/null || true
+  mkdir -p "$REPORT_DIR_DEFAULT" 2>/dev/null || true
+
+  # Best-effort identification
+  DISK_MODEL=$(lsblk -ndo MODEL "$DISK" 2>/dev/null | tr ' ' '_' | tr -cd 'A-Za-z0-9._-')
+  DISK_SERIAL=$(lsblk -ndo SERIAL "$DISK" 2>/dev/null | tr -cd 'A-Za-z0-9._-')
+
+  # Fallbacks
+  [[ -n "$DISK_MODEL" ]] || DISK_MODEL="UNKNOWN_MODEL"
+  [[ -n "$DISK_SERIAL" ]] || DISK_SERIAL="UNKNOWN_SERIAL"
+
+  REPORT_DIR="$REPORT_DIR_DEFAULT"
+  CERT_FILE="$REPORT_DIR/preclear-ng_certificate_${DISK_SERIAL}_$(date '+%Y.%m.%d_%H.%M.%S').txt"
+
+  STATE_FILE="$STATE_DIR/${DISK_SERIAL}.ng.state"
+
+  SMART_INITIAL_FILE="$TMP_DIR/smart_${DISK_SERIAL}_initial.txt"
+  SMART_BEFORE_FILE="$TMP_DIR/smart_${DISK_SERIAL}_before.txt"
+  SMART_AFTER_FILE="$TMP_DIR/smart_${DISK_SERIAL}_after.txt"
+}
+
 main() {
+  [[ $EUID -eq 0 ]] || die "Please run as root (use sudo)."
+
   parse_args "$@"
+  init_disk_info
 
-  [[ -n "$DISK" ]] || die "Disk not set. Use --list to see candidates."
-  [[ -b "$DISK" ]] || die "Not a block device: $DISK"
-
-  is_root || die "Must run as root"
-  require_deps
-
-  if ! is_preclear_candidate "$DISK"; then
-    die "Refusing to run on $DISK (mounted or root disk)."
-  fi
-
-  detect_disk_identity
-  STATE_FILE="${PC_PLUGIN_DIR}/${DISK_SERIAL}.ng.state"
-
+  log "Auto-detected SMART type: $SMART_TYPE"
   log "Starting Preclear-NG unified pipeline on $DISK (serial=$DISK_SERIAL model=$DISK_MODEL)"
-  smart_autodetect_type_if_needed
 
-  smart_init_snapshots
-
-  # resume
-  if [[ "$RESUME" == "y" ]]; then
-    if read_state; then
-      log "Resume enabled: starting from step $START_STEP"
+  if [[ "$RESUME_NG" == "y" ]]; then
+    if state_load; then
+      log "Resume requested; starting at step=$START_STEP (from state file)"
     else
-      log "Resume requested, but no valid state file found; starting at step 1"
-      START_STEP=1
+      log "Resume requested but no valid state file found; starting at step=$START_STEP"
     fi
   fi
 
-  # Ensure thresholds for drive type
-  # (detect_disk_identity already set HDD/SSD defaults)
-
   confirm_destruction
 
-  TOTAL_STARTED_AT=$(date +%s)
   maybe_hdparm_tune
   maybe_fio_probe
+
+  # Snapshot SMART before
+  smart_snapshot "$SMART_BEFORE_FILE"
 
   local cycle
   for cycle in $(seq 1 "$CYCLES"); do
     CUR_CYCLE="$cycle"
 
-    # Step 1
-    if (( START_STEP <= 1 )) && [[ "$SKIP_PREREAD" != "y" ]]; then
-      write_state 1 "$cycle"
-      step_preread
+    # Persist state at step transitions
+    state_write "$START_STEP" "$CUR_CYCLE"
+
+    if (( START_STEP <= 1 )); then
+      if ! step_preread; then
+        local rc=$?
+        if [[ $rc -eq 75 ]]; then echo "TEMP abort triggered. Resume later with --resume-ng"; exit 75; fi
+        write_certificate "FAIL (pre-read)"
+        die "NG pipeline FAILED (pre-read). Certificate: $CERT_FILE"
+      fi
     fi
 
-    # Step 2
-    if (( START_STEP <= 2 )) && [[ "$SKIP_BADBLOCKS" != "y" ]]; then
-      write_state 2 "$cycle"
-      step_badblocks
+    if (( START_STEP <= 2 )) && [[ "$DO_BADBLOCKS" == "y" ]]; then
+      if ! step_badblocks; then
+        local rc=$?
+        if [[ $rc -eq 75 ]]; then echo "TEMP abort triggered. Resume later with --resume-ng"; exit 75; fi
+        write_certificate "FAIL (badblocks)"
+        die "NG pipeline FAILED (badblocks). Certificate: $CERT_FILE"
+      fi
     fi
 
-    # Step 3
-    if (( START_STEP <= 3 )) && [[ "$SKIP_ZERO" != "y" ]]; then
-      write_state 3 "$cycle"
-      step_zero
+    if (( START_STEP <= 3 )) && [[ "$DO_SMART_LONG" == "y" ]]; then
+      if ! step_smart_long; then
+        local rc=$?
+        if [[ $rc -eq 75 ]]; then echo "TEMP abort triggered. Resume later with --resume-ng"; exit 75; fi
+        write_certificate "FAIL (smart long)"
+        die "NG pipeline FAILED (SMART long). Certificate: $CERT_FILE"
+      fi
     fi
 
-    # Step 4
-    if (( START_STEP <= 4 )) && [[ "$SKIP_POSTREAD" != "y" ]]; then
-      write_state 4 "$cycle"
-      step_postread
+    if (( START_STEP <= 4 )); then
+      if ! step_zero; then
+        local rc=$?
+        if [[ $rc -eq 75 ]]; then echo "TEMP abort triggered. Resume later with --resume-ng"; exit 75; fi
+        write_certificate "FAIL (zero write)"
+        die "NG pipeline FAILED (zero). Certificate: $CERT_FILE"
+      fi
     fi
 
-    # Step 5
     if (( START_STEP <= 5 )); then
-      write_state 5 "$cycle"
-      maybe_smart_long_test
-      step_smart_finalize
+      if ! step_finalread; then
+        local rc=$?
+        if [[ $rc -eq 75 ]]; then echo "TEMP abort triggered. Resume later with --resume-ng"; exit 75; fi
+        write_certificate "FAIL (final read)"
+        die "NG pipeline FAILED (final read). Certificate: $CERT_FILE"
+      fi
     fi
 
-    # Step 6
-    if (( START_STEP <= 6 )); then
-      write_state 6 "$cycle"
-      step_certificate
-    fi
-
-    # Next cycle always starts at step 1
     START_STEP=1
   done
 
-  # Cleanup state
-  rm -f "$STATE_FILE" 2>/dev/null || true
-  return 0
+  # Snapshot SMART after + certificate
+  STEP_NUM=6
+  STEP_NAME="Capturing SMART after + generating certificate"
+  smart_snapshot "$SMART_AFTER_FILE"
+  write_certificate "PASS"
+  state_clear
+
+  ng_log_line "PASS: Preclear-NG pipeline finished successfully"
+  draw_hud 6 6 "DONE - PASS (certificate generated)" 100 0 "n/a" "n/a"
+
+  echo "NG pipeline PASSED. Certificate: $CERT_FILE"
+  echo "Log: $LOG_FILE"
 }
 
 main "$@"
